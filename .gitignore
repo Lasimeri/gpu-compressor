@@ -1,0 +1,6 @@
+/target
+*.ptx
+*.log
+*.bak
+.claude/
+*.temp.tar
