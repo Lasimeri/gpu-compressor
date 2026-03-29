@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 // Compress multiple pre-split chunks in a single GPU batch (for multi-file processing)
-pub(crate) fn compress_buffer_bitcomp_multi(
+pub(crate) fn compress_buffer_zstd_multi(
     chunks: &[Vec<u8>],
     device_id: i32,
 ) -> Result<Vec<Vec<u8>>> {
@@ -23,11 +23,9 @@ pub(crate) fn compress_buffer_bitcomp_multi(
 
         let num_chunks = chunks.len();
 
-        // Bitcomp compression options
-        let compress_opts = nvcomp::nvcompBatchedBitcompCompressOpts_t {
-            algorithm: 0, // 0 = default (best compression)
-            data_type: 1, // NVCOMP_TYPE_UCHAR = unsigned bytes
-            reserved: [0; 56],
+        // Zstd compression options
+        let compress_opts = nvcomp::nvcompBatchedZstdCompressOpts_t {
+            reserved: [0; 64],
         };
 
         // Allocate GPU memory for input chunks
@@ -91,7 +89,7 @@ pub(crate) fn compress_buffer_bitcomp_multi(
 
         // Get max compressed size
         let mut max_compressed_chunk_size: usize = 0;
-        nvcomp::nvcompBatchedBitcompCompressGetMaxOutputChunkSize(
+        nvcomp::nvcompBatchedZstdCompressGetMaxOutputChunkSize(
             ZSTD_CHUNK_SIZE,
             compress_opts,
             &mut max_compressed_chunk_size as *mut usize,
@@ -111,7 +109,7 @@ pub(crate) fn compress_buffer_bitcomp_multi(
 
         // Get temp space size using sync version
         let mut temp_bytes: usize = 0;
-        nvcomp::nvcompBatchedBitcompCompressGetTempSizeSync(
+        nvcomp::nvcompBatchedZstdCompressGetTempSizeSync(
             d_uncompressed_ptrs_dev as *const *const std::ffi::c_void,
             d_chunk_sizes_dev as *const usize,
             num_chunks,
@@ -126,7 +124,7 @@ pub(crate) fn compress_buffer_bitcomp_multi(
         cudaMalloc(&mut d_temp, temp_bytes);
 
         // Compress
-        nvcomp::nvcompBatchedBitcompCompressAsync(
+        nvcomp::nvcompBatchedZstdCompressAsync(
             d_uncompressed_ptrs_dev as *const *const std::ffi::c_void,
             d_chunk_sizes_dev as *const usize,
             ZSTD_CHUNK_SIZE,
@@ -359,7 +357,7 @@ pub(crate) async fn compress_multi_files_async(
 
                     // GPU compression timing
                     let gpu_start = Instant::now();
-                    match compress_buffer_bitcomp_multi(&batch_chunks, device_id) {
+                    match compress_buffer_zstd_multi(&batch_chunks, device_id) {
                         Ok(compressed_batch) => {
                             let gpu_time = gpu_start.elapsed().as_secs_f64();
                             total_gpu_time += gpu_time;
@@ -414,7 +412,7 @@ pub(crate) async fn compress_multi_files_async(
                 let batch_size_mb = batch_size_bytes as f64 / 1_000_000.0;
 
                 let gpu_start = Instant::now();
-                let compressed_batch = compress_buffer_bitcomp_multi(&batch_chunks, device_id)?;
+                let compressed_batch = compress_buffer_zstd_multi(&batch_chunks, device_id)?;
                 let gpu_time = gpu_start.elapsed().as_secs_f64();
                 total_gpu_time += gpu_time;
 
@@ -464,7 +462,7 @@ pub(crate) async fn compress_multi_files_async(
         let mut writer_handles = Vec::new();
         for (file_idx, mut write_rx) in write_rxs.into_iter().enumerate() {
             let (_input_path, output_path, file_size, total_chunks) = file_info[file_idx].clone();
-            let input_hash = batch_hashes[file_idx].clone();
+            let _input_hash = batch_hashes[file_idx].clone();
 
             let writer_handle = tokio::spawn(async move {
                 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -472,11 +470,7 @@ pub(crate) async fn compress_multi_files_async(
                 let mut output_file = TokioFile::create(&output_path).await?;
                 let mut chunk_sizes_with_idx = Vec::new();
 
-                // Create .blake3 hash file content (hex hash + newline)
-                let blake3_content = format!("{}\n", input_hash);
-                let blake3_size = blake3_content.len() as u64;
-
-                // Write NVZS header immediately with placeholder for chunk sizes
+                // Write standard NVZS header (28 bytes + N*8 chunk sizes)
                 output_file.write_all(b"NVZS").await?; // Magic (4 bytes)
                 output_file.write_all(&file_size.to_le_bytes()).await?; // Original size (8 bytes)
                 output_file
@@ -486,15 +480,7 @@ pub(crate) async fn compress_multi_files_async(
                     .write_all(&(total_chunks as u64).to_le_bytes())
                     .await?; // Num chunks (8 bytes)
 
-                // Write original file BLAKE3 hash (32 bytes)
-                let hash_bytes = hex::decode(&input_hash)
-                    .map_err(|e| anyhow::anyhow!("Failed to decode hash: {}", e))?;
-                output_file.write_all(&hash_bytes).await?;
-
-                // Write .blake3 file size (8 bytes)
-                output_file.write_all(&blake3_size.to_le_bytes()).await?;
-
-                let chunk_sizes_offset = 68u64; // 4 + 8 + 8 + 8 + 32 + 8 = 68
+                let chunk_sizes_offset = 28u64; // 4 + 8 + 8 + 8 = 28
 
                 // Write placeholder chunk sizes
                 for _ in 0..total_chunks {
@@ -526,12 +512,6 @@ pub(crate) async fn compress_multi_files_async(
                 for &size in &chunk_sizes {
                     output_file.write_all(&(size as u64).to_le_bytes()).await?;
                 }
-
-                // Seek to end of file to append .blake3 hash file
-                output_file.seek(std::io::SeekFrom::End(0)).await?;
-
-                // Append .blake3 file content
-                output_file.write_all(blake3_content.as_bytes()).await?;
 
                 // Final flush
                 output_file.flush().await?;

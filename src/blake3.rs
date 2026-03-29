@@ -8,9 +8,22 @@ use std::time::Instant;
 
 use crate::constants::{BLAKE3_CHUNK_SIZE, PTX_BLAKE3};
 
-/// GPU-accelerated BLAKE3 file hashing with streaming chunks
+/// GPU-accelerated BLAKE3 file hashing (correct spec-compliant implementation)
 pub(crate) fn blake3_hash_file(file_path: &Path, device_id: usize) -> Result<String> {
-    println!("blake3: gpu streaming hash");
+    blake3_hash_file_impl(file_path, device_id, false)
+}
+
+/// GPU-accelerated BLAKE3 file hashing (legacy mode for backward compat with old .nvzs files)
+pub(crate) fn blake3_hash_file_legacy(file_path: &Path, device_id: usize) -> Result<String> {
+    blake3_hash_file_impl(file_path, device_id, true)
+}
+
+fn blake3_hash_file_impl(file_path: &Path, device_id: usize, legacy: bool) -> Result<String> {
+    if !legacy {
+        println!("blake3: gpu streaming hash");
+    } else {
+        println!("blake3: gpu streaming hash (legacy mode)");
+    }
     println!("  input: {}", file_path.display());
 
     let mut file = File::open(file_path)?;
@@ -18,13 +31,11 @@ pub(crate) fn blake3_hash_file(file_path: &Path, device_id: usize) -> Result<Str
 
     println!("  size:  {:.2} GB", file_size as f64 / 1_000_000_000.0);
 
-    // Initialize GPU
     let device = CudaDevice::new(device_id)?;
     let dev = Arc::new(device);
 
     println!("  gpu:   {} ({})", device_id, dev.name()?);
 
-    // Load BLAKE3 kernels
     dev.load_ptx(
         PTX_BLAKE3.into(),
         "blake3_module",
@@ -37,8 +48,7 @@ pub(crate) fn blake3_hash_file(file_path: &Path, device_id: usize) -> Result<Str
         .get_func("blake3_module", "blake3_reduce_tree")
         .ok_or_else(|| anyhow::anyhow!("Failed to load BLAKE3 tree reduction kernel"))?;
 
-    // Stream file in 4MB batches (each batch processes ~4096 x 1KB BLAKE3 chunks in parallel)
-    const BATCH_SIZE: usize = 4 * 1024 * 1024; // 4MB batches keep GPU continuously fed
+    const BATCH_SIZE: usize = 4 * 1024 * 1024;
     let num_batches = file_size.div_ceil(BATCH_SIZE as u64) as usize;
     let total_blake3_chunks = file_size.div_ceil(BLAKE3_CHUNK_SIZE as u64) as usize;
 
@@ -49,28 +59,21 @@ pub(crate) fn blake3_hash_file(file_path: &Path, device_id: usize) -> Result<Str
     }
 
     let total_start = Instant::now();
+    let legacy_flag: u32 = if legacy { 1 } else { 0 };
 
-    // Collect all BLAKE3 chunk hashes (8 u32s per chunk = 32 bytes)
     let mut all_chunk_hashes = Vec::with_capacity(total_blake3_chunks * 8);
     let mut bytes_read = 0u64;
 
-    // Process file in 4MB batches
     for batch_idx in 0..num_batches {
-        // Read 4MB batch from disk
         let batch_bytes = std::cmp::min(BATCH_SIZE as u64, file_size - bytes_read) as usize;
         let mut batch_buffer = vec![0u8; batch_bytes];
         file.read_exact(&mut batch_buffer)?;
 
-        // Calculate how many 1KB BLAKE3 chunks in this batch
         let blake3_chunks_in_batch = batch_bytes.div_ceil(BLAKE3_CHUNK_SIZE);
 
-        // Upload entire batch to GPU
         let d_data = dev.htod_sync_copy(&batch_buffer)?;
-
-        // Allocate output for BLAKE3 chunk hashes
         let d_chunk_outputs = dev.alloc_zeros::<u32>(blake3_chunks_in_batch * 8)?;
 
-        // Launch one thread per 1KB BLAKE3 chunk
         let threads_per_block = 256;
         let num_blocks = blake3_chunks_in_batch.div_ceil(threads_per_block) as u32;
 
@@ -80,7 +83,6 @@ pub(crate) fn blake3_hash_file(file_path: &Path, device_id: usize) -> Result<Str
             shared_mem_bytes: 0,
         };
 
-        // Hash all 1KB chunks within this batch
         unsafe {
             func_chunks.clone().launch(
                 cfg,
@@ -89,19 +91,18 @@ pub(crate) fn blake3_hash_file(file_path: &Path, device_id: usize) -> Result<Str
                     batch_bytes as u64,
                     &d_chunk_outputs,
                     blake3_chunks_in_batch as u64,
+                    legacy_flag,
                 ),
             )?;
         }
 
         dev.synchronize()?;
 
-        // Download the chunk hashes
         let h_chunk_hashes = dev.dtoh_sync_copy(&d_chunk_outputs)?;
         all_chunk_hashes.extend_from_slice(&h_chunk_hashes);
 
         bytes_read += batch_bytes as u64;
 
-        // Show progress every 100 batches or on last batch
         if batch_idx % 100 == 0 || batch_idx == num_batches - 1 {
             let progress = bytes_read as f64 / file_size as f64 * 100.0;
             eprint!(
@@ -123,7 +124,6 @@ pub(crate) fn blake3_hash_file(file_path: &Path, device_id: usize) -> Result<Str
         hash_gbs
     );
 
-    // If single chunk, we're done
     if total_blake3_chunks == 1 {
         let hash_bytes: Vec<u8> = all_chunk_hashes
             .iter()
@@ -133,10 +133,8 @@ pub(crate) fn blake3_hash_file(file_path: &Path, device_id: usize) -> Result<Str
         return Ok(hex::encode(&hash_bytes[0..32]));
     }
 
-    // Tree reduction on GPU: Combine all chunk hashes
     let tree_start = Instant::now();
 
-    // Upload all chunk hashes to GPU for final reduction
     let d_all_hashes = dev.htod_sync_copy(&all_chunk_hashes)?;
     let mut current_hashes = d_all_hashes;
     let mut current_count = total_blake3_chunks;
@@ -181,7 +179,6 @@ pub(crate) fn blake3_hash_file(file_path: &Path, device_id: usize) -> Result<Str
         tree_time.as_secs_f64()
     );
 
-    // Get final hash
     let h_output = dev.dtoh_sync_copy(&current_hashes)?;
     let hash_bytes: Vec<u8> = h_output.iter().flat_map(|&x| x.to_le_bytes()).collect();
 

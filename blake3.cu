@@ -105,7 +105,8 @@ __device__ void compress(uint32_t chaining_value[8], const uint8_t *block,
 
 // Hash a single 1024-byte chunk
 __device__ void hash_chunk(const uint8_t *chunk, uint64_t chunk_counter,
-                          uint32_t key[8], uint8_t flags, uint32_t out[8]) {
+                          uint32_t key[8], uint8_t flags, uint32_t out[8],
+                          uint32_t legacy_mode) {
     uint32_t chaining_value[8];
 
     // Initialize with key
@@ -117,7 +118,12 @@ __device__ void hash_chunk(const uint8_t *chunk, uint64_t chunk_counter,
     uint32_t block_output[16];
     for (int block_idx = 0; block_idx < 16; block_idx++) {
         const uint8_t *block = chunk + (block_idx * BLAKE3_BLOCK_LEN);
-        uint8_t block_flags = flags | CHUNK_START;
+        uint8_t block_flags = flags;
+        if (legacy_mode) {
+            block_flags |= CHUNK_START;
+        } else {
+            if (block_idx == 0) block_flags |= CHUNK_START;
+        }
 
         if (block_idx == 15) {
             block_flags |= CHUNK_END;
@@ -170,7 +176,8 @@ extern "C" __global__ void blake3_hash_chunks(
     const uint8_t* __restrict__ data,
     uint64_t file_len,
     uint32_t* __restrict__ chunk_outputs,  // Output for each chunk (8 u32s per chunk)
-    uint64_t num_chunks
+    uint64_t num_chunks,
+    uint32_t legacy_mode
 ) {
     uint64_t chunk_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -196,7 +203,7 @@ extern "C" __global__ void blake3_hash_chunks(
 
     // For full chunks, use optimized path
     if (chunk_len == BLAKE3_CHUNK_LEN) {
-        hash_chunk(data + chunk_start, chunk_idx, key, flags, chunk_hash);
+        hash_chunk(data + chunk_start, chunk_idx, key, flags, chunk_hash, legacy_mode);
     } else {
         // Partial chunk - process block by block
         uint32_t chaining_value[8];
@@ -220,7 +227,12 @@ extern "C" __global__ void blake3_hash_chunks(
                 block[j] = data[block_start + j];
             }
 
-            uint8_t block_flags = flags | CHUNK_START;
+            uint8_t block_flags = flags;
+            if (legacy_mode) {
+                block_flags |= CHUNK_START;
+            } else {
+                if (block_idx == 0) block_flags |= CHUNK_START;
+            }
             if (block_idx == blocks_in_chunk - 1) {
                 block_flags |= CHUNK_END;
             }

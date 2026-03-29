@@ -5,6 +5,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=blake3.cu");
+    println!("cargo:rerun-if-changed=zstd_compress.cu");
 
     // Link nvCOMP library
     println!("cargo:rustc-link-search=native=/opt/cuda/lib64");
@@ -49,6 +50,29 @@ fn main() {
         panic!(
             "CUDA compilation failed for blake3.cu:\n{}",
             String::from_utf8_lossy(&output_blake3.stderr)
+        );
+    }
+
+    // Compile custom Zstd compression kernel to PTX
+    let output_zstd = Command::new("/opt/cuda/bin/nvcc")
+        .args([
+            "zstd_compress.cu",
+            "-ptx",
+            "-o",
+            "zstd_compress.ptx",
+            "--gpu-architecture=sm_86",
+            "-O3",
+            "--use_fast_math",
+            "--maxrregcount=64",
+            "-Xptxas=-v",
+        ])
+        .output()
+        .expect("Failed to compile zstd_compress.cu");
+
+    if !output_zstd.status.success() {
+        panic!(
+            "CUDA compilation failed for zstd_compress.cu:\n{}",
+            String::from_utf8_lossy(&output_zstd.stderr)
         );
     }
 }

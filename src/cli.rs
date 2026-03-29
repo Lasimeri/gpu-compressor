@@ -42,6 +42,9 @@ pub(crate) enum Commands {
         algorithm: Algorithm,
         #[arg(short, long, default_value = "0")]
         device: i32,
+        /// Compression level: 0 = nvCOMP fast, 1 = custom lazy, 2 = custom optimal
+        #[arg(short = 'l', long, default_value = "0")]
+        level: u32,
     },
     /// Compress multiple files in parallel using GPU (maximizes GPU utilization)
     /// If inputs contains a directory, all files in that directory will be compressed
@@ -56,6 +59,9 @@ pub(crate) enum Commands {
         device: i32,
         #[arg(long, default_value = "134217728")]
         chunk_size: usize, // Default 128MB in bytes
+        /// Compression level: 0 = nvCOMP fast, 1 = custom lazy, 2 = custom optimal
+        #[arg(short = 'l', long, default_value = "0")]
+        level: u32,
     },
     /// Decompress a file using GPU
     Decompress {

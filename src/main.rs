@@ -2,6 +2,7 @@ mod blake3;
 mod cli;
 mod compress_gdeflate;
 mod compress_zstd;
+mod compress_zstd_custom;
 mod constants;
 mod cuda;
 mod decompress;
@@ -31,11 +32,12 @@ async fn main() -> Result<()> {
             output,
             algorithm,
             device,
+            level,
         } => {
             if input.is_dir() {
-                compress_directory(&input, &output, algorithm, device)?;
+                compress_directory(&input, &output, algorithm, device, level)?;
             } else {
-                compress_file(&input, &output, algorithm, device)?;
+                compress_file(&input, &output, algorithm, device, level)?;
             }
         }
         Commands::CompressMulti {
@@ -44,6 +46,7 @@ async fn main() -> Result<()> {
             algorithm,
             device,
             chunk_size,
+            level: _level,
         } => {
             // Expand directories to file lists
             let extension = match algorithm {

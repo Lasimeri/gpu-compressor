@@ -7,7 +7,8 @@ use walkdir::WalkDir;
 use crate::blake3::blake3_hash_file;
 use crate::cli::Algorithm;
 use crate::compress_zstd::compress_buffer;
-use crate::constants::{GDEFLATE_MAX_SIZE, MAX_FILE_CHUNK_SIZE};
+use crate::compress_zstd_custom::compress_chunk_zstd_custom;
+use crate::constants::{CUSTOM_ZSTD_CHUNK_SIZE, GDEFLATE_MAX_SIZE, MAX_FILE_CHUNK_SIZE};
 use crate::cuda::detect_gpus;
 use crate::pipeline::compress_file_streaming_zstd;
 use crate::pipeline_dual::compress_file_streaming_dual_gpu;
@@ -76,8 +77,9 @@ pub(crate) fn compress_file(
     output_path: &Path,
     algorithm: Algorithm,
     device_id: i32,
+    level: u32,
 ) -> Result<()> {
-    compress_file_impl(input_path, output_path, algorithm, device_id, false)
+    compress_file_impl(input_path, output_path, algorithm, device_id, false, level)
 }
 
 pub(crate) fn compress_large_file_in_chunks(
@@ -149,6 +151,7 @@ pub(crate) fn compress_file_impl(
     algorithm: Algorithm,
     device_id: i32,
     quiet: bool,
+    level: u32,
 ) -> Result<()> {
     let file_size = fs::metadata(input_path)?.len() as usize;
 
@@ -171,6 +174,17 @@ pub(crate) fn compress_file_impl(
         Algorithm::Zstd => {
             // Auto-detect GPUs and choose pipeline
             let available_gpus = detect_gpus()?;
+
+            if level > 0 {
+                eprintln!("  mode: custom zstd (level {})", level);
+                return compress_file_custom_zstd(
+                    input_path,
+                    &final_output_path,
+                    device_id,
+                    level,
+                    quiet,
+                );
+            }
 
             if available_gpus.len() >= 2 {
                 // Dual GPU async pipeline
@@ -245,11 +259,157 @@ pub(crate) fn compress_file_impl(
     }
 }
 
+/// Custom Zstd compression: reads file in 4MB streaming chunks, compresses via
+/// custom GPU kernel, writes NVZS container with sub-chunk Zstd frames.
+#[inline(never)]
+fn compress_file_custom_zstd(
+    input_path: &Path,
+    output_path: &Path,
+    device_id: i32,
+    level: u32,
+    quiet: bool,
+) -> Result<()> {
+    use std::io::BufWriter;
+
+    let file_size = fs::metadata(input_path)?.len();
+
+    if !quiet {
+        eprintln!("gpu-compressor: custom zstd compression (level {})", level);
+        eprintln!("  input:  {}", input_path.display());
+        eprintln!("  output: {}", output_path.display());
+        eprintln!("  size:   {:.2} GB", file_size as f64 / 1_000_000_000.0);
+    }
+
+    // Hash input file
+    if !quiet {
+        eprintln!("  hashing input...");
+    }
+    let input_hash = blake3_hash_file(input_path, 0)?;
+    if !quiet {
+        eprintln!("  hash: {}", input_hash);
+    }
+
+    // Prepare tar with hash (matching single-file pipeline behavior)
+    let blake3_content = format!("{}\n", input_hash);
+    let blake3_filename = format!(
+        "{}.blake3",
+        input_path.file_name().unwrap().to_str().unwrap()
+    );
+
+    // Build tar in memory, then compress in sub-chunks
+    // For simplicity, build tar to a temp buffer, then compress in 4MB chunks
+    if !quiet {
+        eprintln!("  building tar archive...");
+    }
+
+    let mut tar_data = Vec::new();
+    {
+        let mut tar_builder = tar::Builder::new(&mut tar_data);
+
+        let original_file = File::open(input_path)?;
+        let file_metadata = original_file.metadata()?;
+        let mut buffered_file = std::io::BufReader::with_capacity(8 * 1024 * 1024, original_file);
+
+        let mut header = tar::Header::new_gnu();
+        header.set_metadata(&file_metadata);
+        header.set_cksum();
+        tar_builder.append_data(
+            &mut header,
+            input_path.file_name().unwrap(),
+            &mut buffered_file,
+        )?;
+
+        let mut blake3_header = tar::Header::new_gnu();
+        blake3_header.set_size(blake3_content.len() as u64);
+        blake3_header.set_mode(0o644);
+        blake3_header.set_cksum();
+        tar_builder.append_data(
+            &mut blake3_header,
+            &blake3_filename,
+            blake3_content.as_bytes(),
+        )?;
+
+        tar_builder.finish()?;
+    }
+
+    let tar_total_size = tar_data.len();
+    let sub_chunk_size = CUSTOM_ZSTD_CHUNK_SIZE; // 64KB sub-chunks
+
+    if !quiet {
+        eprintln!("  tar size: {:.2} MB", tar_total_size as f64 / 1_000_000.0);
+        eprintln!("  compressing...");
+    }
+
+    // Compress entire tar in one GPU batch, producing individual 64KB Zstd frames
+    let (compressed_sub_chunks, _sub_sizes) =
+        compress_chunk_zstd_custom(&tar_data, device_id, level)?;
+
+    let total_nvzs_chunks = compressed_sub_chunks.len();
+    let total_compressed: u64 = compressed_sub_chunks.iter().map(|c| c.len() as u64).sum();
+
+    if !quiet {
+        let ratio = (total_compressed as f64 / tar_total_size as f64) * 100.0;
+        eprintln!(
+            "  {} sub-chunks: {:.2} MB -> {:.2} MB ({:.1}%)",
+            total_nvzs_chunks,
+            tar_total_size as f64 / 1_000_000.0,
+            total_compressed as f64 / 1_000_000.0,
+            ratio
+        );
+    }
+
+    // Write NVZS container — each sub-chunk Zstd frame is a separate NVZS chunk
+    let file = File::create(output_path)?;
+    let mut output_file = BufWriter::with_capacity(8 * 1024 * 1024, file);
+
+    // Header: use 64KB chunk size so decompressor knows each chunk decompresses to 64KB
+    output_file.write_all(b"NVZS")?;
+    output_file.write_all(&(tar_total_size as u64).to_le_bytes())?;
+    output_file.write_all(&(sub_chunk_size as u64).to_le_bytes())?;
+    output_file.write_all(&(total_nvzs_chunks as u64).to_le_bytes())?;
+
+    // Chunk sizes
+    for chunk in &compressed_sub_chunks {
+        output_file.write_all(&(chunk.len() as u64).to_le_bytes())?;
+    }
+
+    // Compressed data
+    for chunk in &compressed_sub_chunks {
+        output_file.write_all(chunk)?;
+    }
+
+    output_file.flush()?;
+
+    let ratio = (total_compressed as f64 / tar_total_size as f64) * 100.0;
+    if !quiet {
+        eprintln!("");
+        eprintln!("  compressed: {:.2} GB ({:.2}%)", total_compressed as f64 / 1_000_000_000.0, ratio);
+    }
+
+    // Hash compressed output
+    if !quiet {
+        eprintln!("  hashing output...");
+    }
+    let output_hash = blake3_hash_file(output_path, 0)?;
+    let hash_path = format!("{}.blake3", output_path.display());
+    let mut hash_file = fs::File::create(&hash_path)?;
+    writeln!(hash_file, "{}", output_hash)?;
+    if !quiet {
+        eprintln!(
+            "  -> {}",
+            PathBuf::from(&hash_path).file_name().unwrap().to_str().unwrap()
+        );
+    }
+
+    Ok(())
+}
+
 pub(crate) fn compress_directory(
     input_dir: &Path,
     output_dir: &Path,
     algorithm: Algorithm,
     device_id: i32,
+    level: u32,
 ) -> Result<()> {
     let algo_name = match algorithm {
         Algorithm::Gdeflate => "Gdeflate",
@@ -371,7 +531,7 @@ pub(crate) fn compress_directory(
         total_input_bytes += file_size;
 
         // Use standard single-file compression (streams, creates tar with .blake3, dual GPU)
-        if let Err(e) = compress_file_impl(input_path, output_path, algorithm, device_id, false) {
+        if let Err(e) = compress_file_impl(input_path, output_path, algorithm, device_id, false, level) {
             eprintln!("    FAILED: {}", e);
             continue;
         }

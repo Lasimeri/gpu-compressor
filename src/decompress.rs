@@ -1,4 +1,4 @@
-use crate::blake3::blake3_hash_file;
+use crate::blake3::{blake3_hash_file, blake3_hash_file_legacy};
 use crate::nvcomp_bindings as nvcomp;
 use anyhow::Result;
 use cuda_runtime_sys::*;
@@ -549,47 +549,98 @@ fn decompress_file_zstd_streaming(
         // Close tar file
         drop(tar_file);
 
-        // Extract tar archive to get original file and .blake3 hash file
-        println!("  extracting archive...");
-        let tar_file_read = File::open(&tar_path)?;
-        let mut tar_archive = tar::Archive::new(tar_file_read);
+        // Detect whether decompressed data is a tar archive or raw file data
+        // (multi-file compression produces raw data, single-file wraps in tar)
+        let is_tar = {
+            let mut probe = File::open(&tar_path)?;
+            let mut header = [0u8; 263];
+            let bytes_read = probe.read(&mut header)?;
+            // Tar archives have "ustar" at offset 257
+            bytes_read >= 263 && &header[257..262] == b"ustar"
+        };
 
-        // Get the directory where output should go
-        let output_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
+        if is_tar {
+            // Standard tar path: extract original file + .blake3 hash
+            println!("  extracting archive...");
+            let tar_file_read = File::open(&tar_path)?;
+            let mut tar_archive = tar::Archive::new(tar_file_read);
 
-        // Extract all files from tar
-        tar_archive.unpack(output_dir)?;
+            // Get the directory where output should go
+            let output_dir = output_path.parent().unwrap_or_else(|| Path::new("."));
 
-        // Find the extracted .blake3 file
-        let blake3_path = format!("{}.blake3", output_path.display());
+            // Extract all files from tar
+            tar_archive.unpack(output_dir)?;
 
-        // Read hash from .blake3 file for verification
-        println!("  verifying integrity...");
-        let mut blake3_file = File::open(&blake3_path)?;
-        let mut blake3_content = String::new();
-        blake3_file.read_to_string(&mut blake3_content)?;
-        let expected_hash = blake3_content.trim();
+            // Find the extracted .blake3 file
+            let blake3_path = format!("{}.blake3", output_path.display());
 
-        // Hash the extracted original file
-        print!("  hashing... ");
-        std::io::stdout().flush()?;
-        // Always use GPU 0 for hashing
-        let decompressed_hash = blake3_hash_file(output_path, 0)?;
-        println!("ok");
+            // Read hash from .blake3 file for verification
+            println!("  verifying integrity...");
+            let mut blake3_file = File::open(&blake3_path)?;
+            let mut blake3_content = String::new();
+            blake3_file.read_to_string(&mut blake3_content)?;
+            let expected_hash = blake3_content.trim();
 
-        if decompressed_hash == expected_hash {
-            println!("  integrity: ok");
+            // Hash the extracted original file
+            print!("  hashing... ");
+            std::io::stdout().flush()?;
+            // Always use GPU 0 for hashing
+            let decompressed_hash = blake3_hash_file(output_path, 0)?;
+            println!("ok");
+
+            if decompressed_hash == expected_hash {
+                println!("  integrity: ok");
+            } else {
+                // Try legacy BLAKE3 (old builds had CHUNK_START on all blocks)
+                println!("  hash mismatch, trying legacy blake3...");
+                let legacy_hash = blake3_hash_file_legacy(output_path, 0)?;
+                if legacy_hash == expected_hash {
+                    println!("  integrity: ok (legacy blake3 -- recompress to update hash)");
+                } else {
+                    println!("  integrity: FAILED");
+                    println!("   Expected: {}", expected_hash);
+                    println!("   Got:      {}", decompressed_hash);
+                    println!("   Legacy:   {}", legacy_hash);
+                    return Err(anyhow::anyhow!(
+                        "Decompressed file hash does not match original"
+                    ));
+                }
+            }
+
+            // Clean up temporary tar file
+            fs::remove_file(&tar_path)?;
         } else {
-            println!("  integrity: FAILED");
-            println!("   Expected: {}", expected_hash);
-            println!("   Got:      {}", decompressed_hash);
-            return Err(anyhow::anyhow!(
-                "Decompressed file hash does not match original"
-            ));
-        }
+            // Raw data path (from multi-file compression): rename temp to output
+            println!("  raw data (no tar wrapper)");
+            fs::rename(&tar_path, output_path)?;
 
-        // Clean up temporary tar file
-        fs::remove_file(&tar_path)?;
+            // Check for external .blake3 sidecar
+            let blake3_sidecar = format!("{}.blake3", input_path.display());
+            if Path::new(&blake3_sidecar).exists() {
+                println!("  verifying integrity (sidecar)...");
+                let mut blake3_file = File::open(&blake3_sidecar)?;
+                let mut blake3_content = String::new();
+                blake3_file.read_to_string(&mut blake3_content)?;
+                let expected_hash = blake3_content.trim();
+
+                let decompressed_hash = blake3_hash_file(output_path, 0)?;
+                if decompressed_hash == expected_hash {
+                    println!("  integrity: ok");
+                } else {
+                    let legacy_hash = blake3_hash_file_legacy(output_path, 0)?;
+                    if legacy_hash == expected_hash {
+                        println!("  integrity: ok (legacy blake3 -- recompress to update hash)");
+                    } else {
+                        println!("  integrity: FAILED");
+                        return Err(anyhow::anyhow!(
+                            "Decompressed file hash does not match original"
+                        ));
+                    }
+                }
+            } else {
+                println!("  no hash sidecar found, skipping integrity check");
+            }
+        }
     }
 
     Ok(())
