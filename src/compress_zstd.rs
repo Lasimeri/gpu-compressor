@@ -1,24 +1,6 @@
-use crate::cli::Algorithm;
-use crate::compress_gdeflate::compress_buffer_gdeflate;
 use crate::nvcomp_bindings as nvcomp;
 use anyhow::Result;
 use cuda_runtime_sys::*;
-
-// Helper function to compress a buffer and return compressed data
-// Processes 64KB chunks in 128MB batches for good performance with manageable VRAM
-pub(crate) fn compress_buffer(
-    input_data: &[u8],
-    algorithm: Algorithm,
-    device_id: i32,
-    _quiet: bool,
-) -> Result<Vec<u8>> {
-    match algorithm {
-        Algorithm::Gdeflate => compress_buffer_gdeflate(input_data, device_id),
-        Algorithm::Zstd => Err(anyhow::anyhow!(
-            "Zstd uses streaming pipeline; use compress_file_impl() instead"
-        )),
-    }
-}
 
 // Streaming: Compress a single chunk immediately (no batching)
 pub(crate) fn compress_chunk_zstd(

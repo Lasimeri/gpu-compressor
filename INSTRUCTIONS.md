@@ -2,27 +2,36 @@
 
 ## overview
 
-gpu-compressor uses NVIDIA GPUs to compress and decompress files via the nvCOMP library and custom CUDA kernels. It supports two algorithms (Zstd and Gdeflate), three Zstd compression levels (nvCOMP fast, custom lazy, custom optimal), automatic dual-GPU detection, streaming pipelines for large files, and GPU-accelerated BLAKE3 integrity verification.
+gpu-compressor uses NVIDIA GPUs to compress and decompress files. Two algorithms are supported:
+
+- **Zstd** — output format `.nvzs`, decompressed by nvCOMP
+- **LZMA2** — output format `.nvlz`, decompressed by liblzma
+
+Both support multiple compression levels. Dual GPU is auto-detected for Zstd L0 and LZMA2 L1+.
+
+---
 
 ## installation
 
 ### prerequisites
 
-- NVIDIA GPU with Compute Capability 8.0+ (Ampere or newer)
-- CUDA Toolkit 12.x (`/opt/cuda` or `/usr/local/cuda`)
-- nvCOMP 3.x headers and libraries
+- NVIDIA GPU, Compute Capability 8.0+ (Ampere or newer, tested on RTX 3090 / 3090 Ti)
+- CUDA Toolkit 12+ including `nvcc` (typically at `/opt/cuda` or `/usr/local/cuda`)
+- nvCOMP 3.x headers and shared library
 - Rust stable toolchain
-- clang (required by bindgen for FFI generation)
+- clang (required by bindgen)
+- libzstd (for Zstd L1/L2 CPU FSE encoding)
+- liblzma (runtime only, loaded via dlopen — must be installed but not linked at build time)
 
 ### install nvCOMP
 
 **Arch Linux (AUR):**
-```
+```bash
 yay -S nvcomp
 ```
 
 **Manual:**
-```
+```bash
 wget https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/nvcomp-linux-x86_64-3.0.6-archive.tar.xz
 tar -xf nvcomp-linux-x86_64-3.0.6-archive.tar.xz
 sudo cp -r nvcomp-linux-x86_64-3.0.6-archive/include/* /usr/local/include/
@@ -32,397 +41,239 @@ sudo ldconfig
 
 ### build
 
-```
+```bash
 cargo build --release
 ```
 
-The binary is at `target/release/gpu-compressor`. The build process:
-1. Generates Rust FFI bindings from nvCOMP C headers via bindgen
-2. Compiles `blake3.cu` to PTX via nvcc (targeting sm_86)
-3. Compiles `zstd_compress.cu` to PTX via nvcc (targeting sm_86, maxrregcount=64)
-4. Embeds both PTX files into the binary at compile time
-5. Links against `libnvcomp` and `libcudart`
+Build compiles two CUDA kernels to PTX, generates nvCOMP FFI bindings via bindgen, and links against nvcomp, cudart, and zstd. PTX files are embedded in the binary.
 
-The release profile uses `codegen-units = 1` to prevent CUDA FFI optimization bugs.
+Binary: `target/release/gpu-compressor`
 
-### install (Arch Linux)
+---
 
-```
-makepkg -si
-```
+## basic usage
 
-This installs the binary to `/usr/bin/gpu-compressor`.
+### compress a file
 
-## commands
+```bash
+# Zstd (default, fastest)
+gpu-compressor compress -i file.bin
+# → file.bin.nvzs
 
-### compress
-
-Compress a single file.
-
-```
-gpu-compressor compress -i <input> -o <output> [-a <algorithm>] [-d <device>] [-l <level>]
+# LZMA2
+gpu-compressor compress -i file.bin -a lzma2
+# → file.bin.nvlz
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-i` | required | Input file or directory |
-| `-o` | required | Output file or directory |
-| `-a` | `zstd` | Algorithm: `zstd` or `gdeflate` |
-| `-d` | `0` | CUDA device ID |
-| `-l` | `0` | Compression level (Zstd only): 0, 1, or 2 |
+### decompress a file
 
-#### compression levels (Zstd only)
+```bash
+# Auto-detects NVZS or NVLZ from magic bytes
+gpu-compressor decompress -i file.bin.nvzs
+# → file.bin
 
-| Level | Engine | Matching | Sub-chunk | Throughput | Ratio |
-|-------|--------|----------|-----------|------------|-------|
-| 0 | nvCOMP batched API | — | 4 MB | Highest | Good |
-| 1 | Custom CUDA kernel | Lazy (depth 16) | 64 KB | Moderate | Better on repetitive data |
-| 2 | Custom CUDA kernel | Optimal (depth 64) | 64 KB | Lower | Best on repetitive data |
-
-- Level 0 uses NVIDIA's nvCOMP library directly — fastest, good general-purpose ratio
-- Levels 1-2 use a custom CUDA kernel (`zstd_compress.cu`) implementing LZ77 match finding with shared-memory hash tables and RFC 8878-compliant FSE encoding
-- Custom levels achieve ~5.3x compression on repetitive data, with safe 1x raw-block fallback on random/incompressible data
-- All levels produce NVZS-format output decompressible by nvCOMP's standard Zstd decompressor
-
-#### Zstd compression behavior
-
-Creates an NVZS archive containing:
-- A tar of the original file + its BLAKE3 hash (`.blake3` sidecar)
-- Compressed in 4 MB streaming chunks (level 0) or 64 KB sub-chunks within 4 MB frames (levels 1-2)
-- Automatic dual-GPU if 2+ GPUs detected (level 0 only — even/odd chunk interleaving)
-- Produces a `.blake3` sidecar for the compressed output
-
-#### Gdeflate compression behavior
-
-Creates an NVGD archive:
-- 64 KB chunks compressed in 128 MB batches
-- Files >2 GB automatically split into 128 MB file chunks (NVMC wrapper format)
-- No tar wrapping, no hash sidecar
-- Compression level fixed at 5 (maximum)
-
-#### directory input
-
-If `-i` is a directory, all files are recursively discovered, hashed, then compressed individually with directory structure preserved under the output path.
-
-```
-# zstd (default, recommended)
-gpu-compressor compress -i data.bin -o data.bin.nvzs
-
-# zstd with custom lazy matching
-gpu-compressor compress -i data.bin -o data.bin.nvzs -l 1
-
-# zstd with custom optimal matching
-gpu-compressor compress -i data.bin -o data.bin.nvzs -l 2
-
-# gdeflate
-gpu-compressor compress -i data.bin -o data.bin.nvgd -a gdeflate
-
-# compress to directory (auto-names output)
-gpu-compressor compress -i data.bin -o /backups/
-
-# compress entire directory
-gpu-compressor compress -i /data/ -o /compressed/
+gpu-compressor decompress -i file.bin.nvlz
+# → file.bin
 ```
 
-### compress-multi
+### specify output path
 
-Compress multiple files concurrently via async pipeline.
-
-```
-gpu-compressor compress-multi -i <file1> <file2> ... -o <out1> <out2> ... [-a zstd] [-d 0] [-l 0] [--chunk-size 134217728]
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-i` | required | Input files (space-separated) or a directory |
-| `-o` | optional | Output files (space-separated); auto-generated if omitted |
-| `-a` | `zstd` | Algorithm (only `zstd` supported for multi) |
-| `-d` | `0` | CUDA device ID |
-| `-l` | `0` | Compression level: 0, 1, or 2 |
-| `--chunk-size` | `134217728` | Chunk size in bytes (default 128 MB) |
-
-Processes 2 files concurrently. Chunks from multiple files are batched together on the GPU for maximum utilization.
-
-```
-gpu-compressor compress-multi -i a.bin b.bin c.bin -o a.nvzs b.nvzs c.nvzs
+```bash
+gpu-compressor compress -i file.bin -o /backups/file.nvzs
+gpu-compressor decompress -i file.bin.nvzs -o /restored/file.bin
 ```
 
-Directory input:
-```
-gpu-compressor compress-multi -i /data/
-```
+### compress multiple files
 
-### decompress
-
-Decompress a single file. Algorithm is auto-detected from the file header (NVZS, NVGD, or NVMC magic bytes).
-
-```
-gpu-compressor decompress -i <input> -o <output> [-d <device>]
+```bash
+gpu-compressor compress -i a.bin b.bin c.bin
+# → a.bin.nvzs  b.bin.nvzs  c.bin.nvzs
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-i` | required | Compressed input file |
-| `-o` | required | Decompressed output path |
-| `-d` | `0` | CUDA device ID |
+### compress a directory
 
-**Zstd decompression:**
-1. Reads NVZS header and compressed chunk sizes
-2. Decompresses each chunk on GPU in micro-batches (1 chunk at a time to minimize VRAM)
-3. Reconstructs the tar archive
-4. Extracts the original file and `.blake3` hash
-5. Verifies integrity by re-hashing the decompressed file against the stored hash
-6. Falls back to legacy BLAKE3 mode if standard hash doesn't match (backward compat with old .nvzs files)
-7. Cleans up temporary tar
-
-**Gdeflate decompression:** loads all compressed chunks, decompresses in a single GPU batch, writes output.
-
-**NVMC decompression:** processes each 128 MB sub-archive independently, concatenates results.
-
-```
-gpu-compressor decompress -i data.bin.nvzs -o /restored/data.bin
-gpu-compressor decompress -i data.bin.nvgd -o /restored/data.bin
+```bash
+gpu-compressor compress -i /data/models/ -o /compressed/models/
 ```
 
-### decompress-multi
+All files under `/data/models/` are compressed recursively. Directory structure is preserved under the output path. Each file becomes an independent `.nvzs` file. LZMA2 directory compression is not supported.
 
-Decompress multiple files sequentially.
+---
 
-```
-gpu-compressor decompress-multi -i <file1> <file2> -o <out1> <out2> [-d 0]
-```
+## compression levels
 
-### hash
+### Zstd levels
 
-Compute a GPU-accelerated BLAKE3 hash.
+| Level | Match Finding | Entropy Coding | Notes |
+|-------|---------------|----------------|-------|
+| 0 (default) | nvCOMP internal | nvCOMP internal | Fastest; dual GPU auto-enabled |
+| 1 | GPU LZ77, depth 16 | CPU ZSTD_compressSequences | Better ratio; single GPU |
+| 2 | GPU LZ77, depth 64 | CPU ZSTD_compressSequences | Best ratio; single GPU |
 
-```
-gpu-compressor hash -i <input> [-d <device>]
-```
-
-Files are streamed in 4 MB batches to the GPU. Each 1 KB BLAKE3 chunk is processed by a dedicated CUDA thread. A tree reduction kernel combines chunk hashes into the final 256-bit hash.
-
-```
-gpu-compressor hash -i data.bin
+```bash
+gpu-compressor compress -i file.bin -l 1
+gpu-compressor compress -i file.bin -l 2
 ```
 
-Output:
+Zstd L1/L2: GPU kernel finds LZ77 matches across 64 KB sub-chunks in parallel. Sequences encoded into Zstd frames by libzstd on CPU. Falls back to `ZSTD_compress(level=1)` per sub-chunk on sequence encoding failure.
+
+### LZMA2 levels
+
+| Level | Pipeline | Notes |
+|-------|----------|-------|
+| 0 (default) | liblzma raw encoder, 8 workers, preset specified by `-l` | `-l 0` through `-l 9` map to liblzma presets |
+| 1+ | Async GPU match finding → N CPU encoder threads (liblzma preset 9) | Both GPUs if available |
+
+```bash
+# L0 with preset 6
+gpu-compressor compress -i file.bin -a lzma2 -l 6
+
+# L1: async GPU+CPU pipeline
+gpu-compressor compress -i file.bin -a lzma2 -l 1
 ```
-  blake3: 381909b9480185c1268658eab4e6503187e84fdae1515d9854c5d840d277e9fe
+
+**Dictionary size** (`--dict-size`): sets the LZMA2 pipeline chunk size (= dictionary window). Larger values improve compression ratio on files with long-range redundancy. Dictionary is stored in host RAM, not VRAM.
+
+```bash
+gpu-compressor compress -i file.bin -a lzma2 --dict-size 256
 ```
 
-## algorithms
+Default: 128 MB. Max limited by available RAM.
 
-### zstd (default)
+---
 
-#### level 0 — nvCOMP
+## GPU selection
 
-GPU-accelerated Zstandard via nvCOMP's batched Zstd API.
+### default
 
-- Chunk size: 4 MB
-- Pipeline: 3-thread (read/compress/write) or 4-thread (dual GPU)
-- Integrity: BLAKE3 hash embedded in tar, verified on decompress
-- Best for: general purpose, maximum throughput
-- File extension: `.nvzs`
+Device 0 is used by default. Zstd L0 auto-detects GPU count; if 2+ GPUs are present, both are used automatically.
 
-#### level 1 — custom lazy matching
+### select a specific GPU
 
-Custom CUDA kernel with LZ77 lazy match finding.
+```bash
+gpu-compressor compress -i file.bin -d 1
+```
 
-- Sub-chunk size: 64 KB (within 4 MB streaming chunks)
-- Hash table: 16K entries, 14-bit, shared memory
-- Search depth: 16 (lazy — checks if next position has a better match)
-- Encoding: RFC 8878 FSE with predefined tables; RLE-mode for uniform-symbol chunks
-- Fallback: raw block wrapping for incompressible data
-- Best for: repetitive data where nvCOMP's fast mode under-compresses
-- File extension: `.nvzs`
+### force single GPU
 
-#### level 2 — custom optimal matching
+```bash
+CUDA_VISIBLE_DEVICES=0 gpu-compressor compress -i file.bin
+```
 
-Same custom CUDA kernel with deeper search.
+### dual GPU behavior
 
-- Search depth: 64 (optimal — evaluates more match candidates)
-- Higher compression ratio at the cost of throughput
-- Same FSE encoding and fallback behavior as level 1
-- Best for: maximum compression ratio on compressible data
-- File extension: `.nvzs`
+**Zstd L0:** Reader distributes chunks alternately — even to GPU 0, odd to GPU 1. Writer reorders results by chunk index.
 
-### gdeflate
+**LZMA2 L1+:** Both GPUs run HC4 match finding and push sub-block jobs into a shared MPMC job queue. CPU encoder pool drains independently. Round-robin distribution is implicit via crossbeam MPMC channel.
 
-GPU-accelerated DEFLATE via nvCOMP's batched Gdeflate API.
+**Zstd L1/L2 and LZMA2 L0:** Single GPU only.
 
-- Chunk size: 64 KB
-- Batch size: 128 MB on GPU
-- Compression level: 5 (maximum)
-- File size limit: ~2 GB per chunk (auto-splits larger files via NVMC)
-- Best for: DEFLATE compatibility
-- File extension: `.nvgd`
+---
+
+## VRAM requirements
+
+| Mode | VRAM per GPU |
+|------|-------------|
+| Zstd L0 | ~16 MB active per chunk (8 MB in + 8 MB out) |
+| Zstd L1/L2 | ~64 KB per sub-chunk + GPU match output buffers |
+| LZMA2 L0 | No GPU usage |
+| LZMA2 L1+ | ~552 MB per pipeline chunk (fits 4 GB GPUs) |
+
+---
+
+## output naming
+
+### compression
+
+| Input | Algorithm | `-o` | Output |
+|-------|-----------|------|--------|
+| `file.bin` | zstd | omitted | `file.bin.nvzs` |
+| `file.bin` | lzma2 | omitted | `file.bin.nvlz` |
+| `file.bin` | zstd | `/out/file.nvzs` | `/out/file.nvzs` |
+| `file.bin` | zstd | `/out/` (dir) | `/out/file.bin.nvzs` |
+| `a.bin b.bin` | zstd | omitted | `a.bin.nvzs b.bin.nvzs` |
+| `a.bin b.bin` | zstd | `/out/` (dir) | `/out/a.bin.nvzs /out/b.bin.nvzs` |
+
+### decompression
+
+| Input | `-o` | Output |
+|-------|------|--------|
+| `file.bin.nvzs` | omitted | `file.bin` |
+| `file.bin.nvlz` | omitted | `file.bin` |
+| `file.compressed` | omitted | `file.compressed.out` |
+| `file.bin.nvzs` | `/out/file.bin` | `/out/file.bin` |
+| `file.bin.nvzs` | `/out/` (dir) | `/out/file.bin` |
+
+---
 
 ## file formats
 
-### NVZS (Zstd compressed)
+### NVZS (Zstd)
 
 ```
-offset  size    field
-0       4       magic: "NVZS"
-4       8       original tar size (u64 LE)
-12      8       chunk size (u64 LE, typically 4194304)
-20      8       num chunks (u64 LE)
-28      N*8     compressed sizes array (u64 LE each)
-28+N*8  ...     compressed chunk data (concatenated)
+[0:4]    "NVZS" magic
+[4:12]   Original file size (u64 LE)
+[12:20]  Chunk size (u64 LE, 8388608 = 8 MB)
+[20:28]  Number of chunks N (u64 LE)
+[28:]    N × 8 bytes: compressed size per chunk (u64 LE)
+[28+N*8:] Compressed chunk data
 ```
 
-The "original" data is a tar archive containing:
-- The input file with its original filename
-- A `.blake3` file containing the hex-encoded BLAKE3 hash
+L0 chunks: single Zstd frame. L1/L2 chunks: multiple concatenated Zstd frames (one per 64 KB sub-chunk).
 
-For custom Zstd levels (1-2), each 4 MB chunk contains multiple concatenated Zstd frames (one per 64 KB sub-chunk). These are valid Zstd and decompress identically via nvCOMP's standard API.
-
-### NVGD (Gdeflate compressed)
+### NVLZ (LZMA2)
 
 ```
-offset  size    field
-0       4       magic: "NVGD"
-4       8       original size (u64 LE)
-12      8       chunk size (u64 LE, typically 65536)
-20      8       num chunks (u64 LE)
-28      N*8     compressed sizes array (u64 LE each)
-28+N*8  ...     compressed chunk data (concatenated)
+[0:4]    "NVLZ" magic
+[4:12]   Original file size (u64 LE)
+[12:20]  Chunk size (u64 LE — equals dict-size for L0, 65536 for L1+)
+[20:28]  Number of chunks N (u64 LE)
+[28:]    N × 8 bytes: compressed size per chunk (u64 LE)
+[28+N*8:] Raw LZMA2 streams (one per chunk)
 ```
 
-### NVMC (multi-chunk wrapper)
+L0: each chunk is a single raw LZMA2 stream. L1+: each chunk is N concatenated 64 KB sub-block streams, each independently decompressible by `lzma_raw_decoder`.
 
-Used when Gdeflate input exceeds ~2 GB. Wraps multiple NVGD archives:
-
-```
-offset  size    field
-0       4       magic: "NVMC"
-4       8       original file size (u64 LE)
-12      8       num file chunks (u64 LE)
-20      ...     concatenated NVGD archives (one per 128 MB chunk)
-```
-
-## GPU behavior
-
-### device selection
-
-- `-d 0` selects GPU 0 (default)
-- Zstd level 0 auto-detects GPU count and uses dual-GPU when 2+ are available
-- Zstd levels 1-2 use single GPU (custom kernel pipeline)
-- BLAKE3 hashing uses GPU 0 regardless of `-d` flag
-- `CUDA_VISIBLE_DEVICES` environment variable can restrict visible GPUs
-
-### dual GPU mode
-
-When 2+ GPUs are detected during Zstd level 0 compression:
-- Reader thread distributes 4 MB tar chunks alternately to GPU 0 (even indices) and GPU 1 (odd indices)
-- Each GPU compresses independently via nvCOMP
-- Writer thread reorders results via BTreeMap and writes sequentially
-- ~1.5-1.8x throughput vs single GPU (limited by PCIe bandwidth)
-
-To force single GPU:
-```
-CUDA_VISIBLE_DEVICES=0 gpu-compressor compress -i file.bin -o file.nvzs
-```
-
-### VRAM usage
-
-- Zstd streaming (level 0): ~8 MB per active chunk (4 MB uncompressed + 4 MB compressed buffer)
-- Zstd custom (levels 1-2): ~64 KB per sub-chunk + match output buffers + hash table in shared memory
-- Gdeflate batched: up to 128 MB batch + compressed buffers + temp workspace
-- BLAKE3: ~4 MB per batch + chunk hash output arrays
-- Multi-file: scales with batch size (default 9 chunks per GPU batch)
-
-## integrity verification
-
-Zstd compression automatically:
-1. Hashes the input file with GPU BLAKE3 before compression
-2. Embeds the hash inside the tar archive as a `.blake3` sidecar file
-3. Hashes the compressed output and writes a `.blake3` sidecar alongside it
-
-Zstd decompression automatically:
-1. Decompresses the tar archive
-2. Extracts the original file and stored hash
-3. Re-hashes the decompressed file on GPU
-4. Compares against the stored hash
-5. If mismatch: retries with legacy BLAKE3 mode (for files compressed with older versions)
-6. Fails with an error if both standard and legacy hashes don't match
-
-Gdeflate does not include integrity verification.
-
-## examples
-
-### compress a large dataset
-```
-gpu-compressor compress -i /data/model_weights.bin -o /backups/model_weights.nvzs
-```
-
-### compress with better ratio (custom kernel)
-```
-gpu-compressor compress -i /data/model_weights.bin -o /backups/model_weights.nvzs -l 1
-```
-
-### compress an entire directory
-```
-gpu-compressor compress -i /data/training/ -o /backups/training/ -a gdeflate
-```
-
-### batch compress multiple files
-```
-gpu-compressor compress-multi \
-    -i file1.bin file2.bin file3.bin \
-    -o file1.nvzs file2.nvzs file3.nvzs
-```
-
-### batch compress with custom level
-```
-gpu-compressor compress-multi \
-    -i file1.bin file2.bin file3.bin \
-    -o file1.nvzs file2.nvzs file3.nvzs \
-    -l 2
-```
-
-### verify a file hash
-```
-gpu-compressor hash -i /data/model_weights.bin
-```
-
-### decompress and verify
-```
-gpu-compressor decompress -i /backups/model_weights.nvzs -o /restored/model_weights.bin
-```
-Integrity is checked automatically. If the hash doesn't match, the command fails.
-
-### force single GPU
-```
-CUDA_VISIBLE_DEVICES=0 gpu-compressor compress -i large.bin -o large.nvzs
-```
+---
 
 ## troubleshooting
 
 ### "No NVIDIA GPUs detected"
-- Verify `nvidia-smi` shows your GPU
-- Ensure CUDA toolkit is installed and `libcudart.so` is on the library path
 
-### "Unable to generate nvCOMP bindings"
-- Install nvCOMP headers: `ls /usr/local/include/nvcomp.h` or `/usr/include/nvcomp.h`
+- Verify: `nvidia-smi`
+- Verify CUDA runtime: `ldconfig -p | grep libcudart`
+- If using `CUDA_VISIBLE_DEVICES`, ensure it is not empty
+
+### "Unable to generate nvCOMP bindings" (build error)
+
+- Install nvCOMP headers: `ls /usr/local/include/nvcomp.h`
 - Install clang: `pacman -S clang` or `apt install libclang-dev`
 
-### "Failed to compile blake3.cu" or "Failed to compile zstd_compress.cu"
-- Ensure nvcc is available: `/opt/cuda/bin/nvcc --version`
-- Both kernels target sm_86 (Ampere). For older GPUs, edit `build.rs` to change `--gpu-architecture=sm_XX`
+### "Failed to compile zstd_compress.cu" or "lzma2_match_find.cu"
 
-### segfault on exit after successful compression
-- Known issue with CUDA context cleanup during async runtime teardown
-- The operation completed successfully; the exit code is non-zero but output is valid
-- Mitigated with `std::process::exit(0)` in current builds
+- Verify nvcc: `/opt/cuda/bin/nvcc --version`
+- Kernels target `sm_86` (RTX 30xx). For other GPUs edit `--gpu-architecture=sm_XX` in `build.rs`
+- Supported: sm_80 (A100), sm_86 (RTX 3090), sm_89 (RTX 4090), sm_90 (H100)
 
-### decompression fails with "status 1000"
-- nvcomp error code 1000 = `nvcompErrorCudaError`
-- Usually indicates corrupted compressed data or VRAM exhaustion
-- Check `nvidia-smi` for available GPU memory
+### "Failed to open liblzma" (LZMA2 runtime error)
 
-### decompression hash mismatch on old files
-- Files compressed with earlier versions used a non-spec BLAKE3 chunk flag
-- The decompressor automatically retries with legacy BLAKE3 mode
-- If both modes fail, the file is genuinely corrupted
+- Install liblzma: `pacman -S xz` or `apt install liblzma-dev`
+- Verify: `ldconfig -p | grep liblzma`
+- liblzma is loaded via dlopen at runtime — not a link-time dependency
+
+### LZMA2 decompression produces garbled output
+
+- NVLZ chunks are independent raw LZMA2 streams — partial truncation corrupts all subsequent chunks
+- Verify `original_size` in header matches expected output size
+
+### compression produces no size reduction on random/encrypted data
+
+- Zstd L0 will produce output slightly larger than input (frame header overhead)
+- Zstd L1/L2 falls back to `ZSTD_compress(level=1)` per sub-chunk if GPU sequences yield no benefit
+- LZMA2 on random data: expect near 1:1 ratio or slight expansion
+- Use Zstd L0 for incompressible data to minimize overhead
+
+### TUI output garbled in non-terminal environments
+
+- TUI uses ANSI escape codes for cursor movement
+- Redirect stderr to suppress: `2>/dev/null` or `2>log.txt`

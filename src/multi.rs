@@ -1,10 +1,7 @@
-use crate::blake3::blake3_hash_file;
-use crate::cli::Algorithm;
 use crate::constants::ZSTD_CHUNK_SIZE;
 use crate::nvcomp_bindings as nvcomp;
 use anyhow::Result;
 use cuda_runtime_sys::*;
-use std::fs::{self};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -191,7 +188,6 @@ pub(crate) fn compress_buffer_zstd_multi(
 pub(crate) async fn compress_multi_files_async(
     inputs: &[PathBuf],
     outputs: &[PathBuf],
-    algorithm: Algorithm,
     device_id: i32,
     chunk_size: usize,
 ) -> Result<()> {
@@ -199,12 +195,6 @@ pub(crate) async fn compress_multi_files_async(
     use tokio::fs::File as TokioFile;
     use tokio::io::AsyncReadExt;
     use tokio::sync::mpsc;
-
-    if algorithm != Algorithm::Zstd {
-        return Err(anyhow::anyhow!(
-            "Async multi-file processing currently only supports Zstd algorithm"
-        ));
-    }
 
     println!("gpu-compressor: zstd multi-file compression");
     println!(
@@ -244,22 +234,6 @@ pub(crate) async fn compress_multi_files_async(
         grand_total_size as f64 / 1_000_000_000.0
     );
 
-    // Hash all input files before compression
-    println!("  hashing inputs...");
-    let mut input_hashes = Vec::new();
-    for (input_path, _, _, _) in &all_file_info {
-        print!(
-            "    {}... ",
-            input_path.file_name().unwrap().to_str().unwrap()
-        );
-        std::io::stdout().flush()?;
-        // Always use GPU 0 for hashing
-        let hash = blake3_hash_file(input_path, 0)?;
-        println!("ok");
-        input_hashes.push(hash);
-    }
-    println!("  hashing complete.\n");
-
     let overall_start_time = Instant::now();
 
     // Process files in batches of 2
@@ -267,7 +241,6 @@ pub(crate) async fn compress_multi_files_async(
     for batch_idx in (0..all_file_info.len()).step_by(MAX_CONCURRENT_FILES) {
         let batch_end = std::cmp::min(batch_idx + MAX_CONCURRENT_FILES, all_file_info.len());
         let file_info: Vec<_> = all_file_info[batch_idx..batch_end].to_vec();
-        let batch_hashes: Vec<_> = input_hashes[batch_idx..batch_end].to_vec();
 
         println!(
             "  batch {}-{}/{}",
@@ -462,7 +435,6 @@ pub(crate) async fn compress_multi_files_async(
         let mut writer_handles = Vec::new();
         for (file_idx, mut write_rx) in write_rxs.into_iter().enumerate() {
             let (_input_path, output_path, file_size, total_chunks) = file_info[file_idx].clone();
-            let _input_hash = batch_hashes[file_idx].clone();
 
             let writer_handle = tokio::spawn(async move {
                 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -552,41 +524,10 @@ pub(crate) async fn compress_multi_files_async(
             );
         }
 
-        // Reset GPU state after dual-GPU compression before hashing
+        // Synchronize GPU state after batch
         unsafe {
-            cuda_runtime_sys::cudaSetDevice(0);
+            cuda_runtime_sys::cudaSetDevice(device_id);
             cuda_runtime_sys::cudaDeviceSynchronize();
-            cuda_runtime_sys::cudaDeviceReset();
-            cuda_runtime_sys::cudaSetDevice(1);
-            cuda_runtime_sys::cudaDeviceSynchronize();
-            cuda_runtime_sys::cudaDeviceReset();
-            cuda_runtime_sys::cudaSetDevice(0);
-        }
-
-        // Hash compressed output files and write hash to .blake3 files
-        println!("  hashing outputs...");
-        for (_input_path, output_path, _, _) in &file_info {
-            print!(
-                "    {}... ",
-                output_path.file_name().unwrap().to_str().unwrap()
-            );
-            std::io::stdout().flush()?;
-            // Always use GPU 0 for hashing (compression may use both GPUs)
-            let output_hash = blake3_hash_file(output_path, 0)?;
-
-            // Write hash to .blake3 file
-            let hash_blake3_path = format!("{}.blake3", output_path.display());
-            let mut hash_file = fs::File::create(&hash_blake3_path)?;
-            writeln!(hash_file, "{}", output_hash)?;
-
-            println!(
-                "ok -> {}",
-                PathBuf::from(&hash_blake3_path)
-                    .file_name()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-            );
         }
 
         let batch_elapsed = batch_start_time.elapsed();

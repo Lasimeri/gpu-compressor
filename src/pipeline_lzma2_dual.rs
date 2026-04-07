@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use anyhow::Result;
 use crossbeam_channel::bounded;
 use std::collections::BTreeMap;
@@ -9,22 +10,23 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crate::compress_zstd::compress_chunk_zstd;
-use crate::constants::ZSTD_CHUNK_SIZE;
+use crate::compress_lzma2::compress_chunk_lzma2;
+use crate::constants::LZMA2_CHUNK_SIZE;
 use crate::format::{CompressedChunk, PipelineMsg};
 use crate::tui::TuiState;
 
-/// Dual GPU async pipeline: Process alternating chunks on two GPUs simultaneously
-pub(crate) fn compress_file_streaming_dual_gpu(
+/// Dual GPU async pipeline: Process alternating chunks on two GPUs simultaneously (LZMA2)
+pub(crate) fn compress_file_streaming_lzma2_dual_gpu(
     input_path: &Path,
     output_path: &Path,
     gpu0: i32,
     gpu1: i32,
     _quiet: bool,
+    level: u32,
 ) -> Result<()> {
     let file_size = fs::metadata(input_path)?.len();
 
-    let mode_label = "zstd compression (dual gpu)".to_string();
+    let mode_label = "lzma2 compression (dual gpu)".to_string();
 
     // 8MB buffering: 2 chunks per GPU for smooth I/O
     const PIPELINE_QUEUE_SIZE: usize = 2;
@@ -110,7 +112,7 @@ pub(crate) fn compress_file_streaming_dual_gpu(
         let mut remaining = file_size;
 
         while remaining > 0 {
-            let to_read = std::cmp::min(ZSTD_CHUNK_SIZE as u64, remaining) as usize;
+            let to_read = std::cmp::min(LZMA2_CHUNK_SIZE as u64, remaining) as usize;
             let mut buf = vec![0u8; to_read];
             file.read_exact(&mut buf)?;
             remaining -= to_read as u64;
@@ -144,6 +146,8 @@ pub(crate) fn compress_file_streaming_dual_gpu(
         Ok(())
     });
 
+    let preset = level.min(9);
+
     // GPU 0 thread: Compress even chunks (0, 2, 4, ...)
     let bytes_compressed_gpu0 = bytes_compressed.clone();
     let compress_tx0 = compress_tx.clone();
@@ -155,7 +159,7 @@ pub(crate) fn compress_file_streaming_dual_gpu(
                     chunk_gpu0_gpu.store(chunk_index as u64, Ordering::Relaxed);
 
                     let (compressed_chunks, sizes) =
-                        compress_chunk_zstd(&data, gpu0).map_err(|e| {
+                        compress_chunk_lzma2(&data, 16 * 1024 * 1024, preset).map_err(|e| {
                             anyhow::anyhow!(
                                 "GPU {} compression failed for chunk {}: {}",
                                 gpu0,
@@ -199,7 +203,7 @@ pub(crate) fn compress_file_streaming_dual_gpu(
                     chunk_gpu1_gpu.store(chunk_index as u64, Ordering::Relaxed);
 
                     let (compressed_chunks, sizes) =
-                        compress_chunk_zstd(&data, gpu1).map_err(|e| {
+                        compress_chunk_lzma2(&data, 16 * 1024 * 1024, preset).map_err(|e| {
                             anyhow::anyhow!(
                                 "GPU {} compression failed for chunk {}: {}",
                                 gpu1,
@@ -244,11 +248,11 @@ pub(crate) fn compress_file_streaming_dual_gpu(
         let mut output_file = BufWriter::with_capacity(16 * 1024 * 1024, file);
 
         // Write header using raw file size
-        let total_chunks = (file_size as usize).div_ceil(ZSTD_CHUNK_SIZE);
+        let total_chunks = (file_size as usize).div_ceil(LZMA2_CHUNK_SIZE);
 
-        output_file.write_all(b"NVZS")?;
+        output_file.write_all(b"NVLZ")?;
         output_file.write_all(&file_size.to_le_bytes())?;
-        output_file.write_all(&(ZSTD_CHUNK_SIZE as u64).to_le_bytes())?;
+        output_file.write_all(&(LZMA2_CHUNK_SIZE as u64).to_le_bytes())?;
         output_file.write_all(&(total_chunks as u64).to_le_bytes())?;
 
         let sizes_offset = output_file.stream_position()?;

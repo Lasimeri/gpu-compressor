@@ -493,7 +493,9 @@ __device__ __forceinline__ void bs_init(BitStream* bs, uint8_t* dst, uint32_t st
 }
 
 __device__ __forceinline__ void bs_addBits(BitStream* bs, uint64_t value, uint32_t nbBits) {
-    bs->bits |= (value << bs->nbBits);
+    if (nbBits == 0) return;
+    uint64_t mask = (1ULL << nbBits) - 1;
+    bs->bits |= ((value & mask) << bs->nbBits);
     bs->nbBits += nbBits;
 }
 
@@ -566,8 +568,9 @@ __device__ void fse_build(DynFSE* tbl, int16_t* nc, int maxSym, int aLog) {
     }
 
     // Build stateTable
+    // nc == -1 → 1 slot (less-than-one probability), nc == 0 → 0 slots (absent), nc > 0 → nc slots
     uint32_t cumul[65]; cumul[0] = 0;
-    for (int s = 0; s <= maxSym; s++) cumul[s+1] = cumul[s] + (nc[s] <= 0 ? 1 : (uint32_t)nc[s]);
+    for (int s = 0; s <= maxSym; s++) cumul[s+1] = cumul[s] + (nc[s] < 0 ? 1 : (uint32_t)nc[s]);
     uint32_t tc[65];
     for (int s = 0; s <= maxSym + 1; s++) tc[s] = cumul[s];
     for (int u = 0; u < tSize; u++) {
@@ -601,7 +604,7 @@ __device__ void fse_build(DynFSE* tbl, int16_t* nc, int maxSym, int aLog) {
 }
 
 // Write FSE table description into output buffer (RFC 8878 §4.1.1)
-// Returns bytes written
+// Returns bytes written (rounded to byte boundary)
 __device__ uint32_t fse_write_table_desc(uint8_t* dst, int16_t* nc, int maxSym, int aLog) {
     BitStream tbs;
     bs_init(&tbs, dst, 0);
@@ -637,6 +640,49 @@ __device__ uint32_t fse_write_table_desc(uint8_t* dst, int16_t* nc, int maxSym, 
     uint32_t sz = tbs.pos;
     if (tbs.nbBits > 0) { dst[sz++] = (uint8_t)tbs.bits; }
     return sz;
+}
+
+// Write FSE table description into an existing bitstream
+__device__ void fse_write_table_desc_bs(BitStream* bs, int16_t* nc, int maxSym, int aLog) {
+    bs_addBits(bs, aLog - 5, 4);
+
+    int remaining = (1 << aLog);
+    for (int s = 0; s <= maxSym && remaining > 0; s++) {
+        int16_t count = nc[s];
+        int prob = (count == -1) ? 1 : count;
+        int value = count + 1;
+        int maxVal = remaining + 1;
+        int nbBits = highbit32(maxVal) + 1;
+        int threshold = (1 << nbBits) - 1 - maxVal;
+
+        if (value < threshold) {
+            bs_addBits(bs, value, nbBits - 1);
+        } else {
+            bs_addBits(bs, value + threshold, nbBits);
+        }
+        remaining -= prob;
+        bs_flush(bs);
+
+        if (count == 0) {
+            int run = 0;
+            while (s + 1 + run <= maxSym && nc[s + 1 + run] == 0) run++;
+            while (run >= 3) { bs_addBits(bs, 3, 2); run -= 3; s += 3; }
+            bs_addBits(bs, run, 2);
+            s += run;
+            bs_flush(bs);
+        }
+    }
+}
+
+// Finalize table descriptions bitstream: flush remaining bits to byte boundary
+__device__ uint32_t fse_finish_table_descs(BitStream* bs) {
+    bs_flush(bs);
+    if (bs->nbBits > 0) {
+        bs->dst[bs->pos++] = (uint8_t)(bs->bits);
+        bs->bits = 0;
+        bs->nbBits = 0;
+    }
+    return bs->pos;
 }
 
 // FSE encode symbol
@@ -695,8 +741,16 @@ __device__ void fse_normalize(uint32_t* hist, int maxSym, int aLog, int16_t* nc)
 
 // ============================================================================
 // Kernel: zstd_encode_block
-// Encodes match-finder output into a Zstd compressed frame using predefined
-// FSE tables. Falls back to raw block if compressed size >= uncompressed.
+// Encodes match-finder output into a Zstd compressed frame.
+// Supports FSE_Compressed mode for non-uniform code distributions.
+// Falls back to raw block if compressed size >= uncompressed.
+//
+// Reference: ZSTD_encodeSequences_body() in facebook/zstd
+// Bit order (per RFC 8878):
+//   Written forward, read backward by decoder.
+//   First sequence encoded = LAST sequence (backward iteration).
+//   Per sequence: FSE state bits (LL, ML, OF), then extra bits (LL, ML, OF).
+//   Final: flush states (ML, OF, LL), sentinel 1-bit, zero-pad to byte.
 // ============================================================================
 
 extern "C" __global__ void zstd_encode_block(
@@ -731,6 +785,9 @@ extern "C" __global__ void zstd_encode_block(
     uint8_t* dst = output + (uint64_t)chunk_idx * max_frame_size;
     uint32_t pos = 0;
 
+    // Safety limit: stop writing if we approach max_frame_size
+    uint32_t safe_limit = max_frame_size - 64;
+
     // === Frame Magic ===
     write_le32(dst + pos, ZSTD_MAGIC);
     pos += 4;
@@ -746,7 +803,7 @@ extern "C" __global__ void zstd_encode_block(
         dst[pos++] = (uint8_t)this_chunk_size;
     }
 
-    // If no sequences (all literals) or too few to bother, emit raw block
+    // If no sequences, emit raw block
     if (n_seqs == 0) {
         const uint8_t* src = input + chunk_start;
         uint32_t bh = 1u | (ZSTD_BLOCK_TYPE_RAW << 1) | (this_chunk_size << 3);
@@ -756,10 +813,69 @@ extern "C" __global__ void zstd_encode_block(
         return;
     }
 
-    // === Build compressed block in a temp buffer ===
-    // We write to dst starting after frame header, then check if it's smaller than raw.
+    // === Build frequency histograms (codes computed on-the-fly, no arrays) ===
+    uint32_t llHist[36]; for (int i = 0; i < 36; i++) llHist[i] = 0;
+    uint32_t mlHist[53]; for (int i = 0; i < 53; i++) mlHist[i] = 0;
+    uint32_t ofHist[32]; for (int i = 0; i < 32; i++) ofHist[i] = 0;
+
+    uint8_t llMax = 0, mlMax = 0, ofMax = 0;
+    uint8_t llMin = 255, mlMin = 255, ofMin = 255;
+
+    for (uint32_t i = 0; i < n_seqs; i++) {
+        uint8_t lc = ll_code(my_seqs[i].literal_length);
+        uint8_t mc = ml_code(my_seqs[i].match_length);
+        uint8_t oc = of_code(my_seqs[i].offset);
+
+        llHist[lc]++; mlHist[mc]++; ofHist[oc]++;
+        if (lc > llMax) llMax = lc; if (lc < llMin) llMin = lc;
+        if (mc > mlMax) mlMax = mc; if (mc < mlMin) mlMin = mc;
+        if (oc > ofMax) ofMax = oc; if (oc < ofMin) ofMin = oc;
+    }
+
+    // Per-dimension mode
+    bool llRLE = (llMin == llMax);
+    bool ofRLE = (ofMin == ofMax);
+    bool mlRLE = (mlMin == mlMax);
+
+    // Accuracy logs (minimum 5 per RFC 8878 §4.1.1)
+    int llALog = 6, mlALog = 6, ofALog = 5;
+
+    // Build FSE tables for non-RLE dimensions
+    DynFSE llTbl, mlTbl, ofTbl;
+    int16_t llNC[36], mlNC[53], ofNC[32];
+
+    if (!llRLE) {
+        fse_normalize(llHist, (int)llMax, llALog, llNC);
+        fse_build(&llTbl, llNC, (int)llMax, llALog);
+    }
+    if (!ofRLE) {
+        fse_normalize(ofHist, (int)ofMax, ofALog, ofNC);
+        fse_build(&ofTbl, ofNC, (int)ofMax, ofALog);
+    }
+    if (!mlRLE) {
+        fse_normalize(mlHist, (int)mlMax, mlALog, mlNC);
+        fse_build(&mlTbl, mlNC, (int)mlMax, mlALog);
+    }
+
+
+    // === Build compressed block ===
     uint32_t block_header_pos = pos;
     pos += 3; // reserve for block header
+
+    // Early bailout: if literals alone >= chunk size, raw block is guaranteed smaller.
+    // Writing n_lits bytes into the output before the safe_limit check would overflow
+    // max_frame_size and corrupt adjacent sub-chunks.
+    if (n_lits + 16 >= this_chunk_size) {
+        pos = block_header_pos;
+        const uint8_t* src_early = input + chunk_start;
+        uint32_t bh_early = 1u | (ZSTD_BLOCK_TYPE_RAW << 1) | (this_chunk_size << 3);
+        dst[pos++] = (uint8_t)(bh_early);
+        dst[pos++] = (uint8_t)(bh_early >> 8);
+        dst[pos++] = (uint8_t)(bh_early >> 16);
+        for (uint32_t i = 0; i < this_chunk_size; i++) dst[pos++] = src_early[i];
+        output_sizes[chunk_idx] = pos;
+        return;
+    }
 
     // --- Literals Section (Raw) ---
     if (n_lits < 32) {
@@ -784,28 +900,133 @@ extern "C" __global__ void zstd_encode_block(
         write_le16(dst + pos, (uint16_t)(n_seqs - 0x7F00)); pos += 2;
     }
 
-    // --- Compute codes for all sequences ---
-    uint8_t llCodes[21846], mlCodes[21846], ofCodes[21846];
-    uint8_t llMin=255, llMax=0, mlMin=255, mlMax=0, ofMin=255, ofMax=0;
+    // --- Mode byte: LL, OF, ML (1=RLE, 2=FSE_Compressed) ---
+    uint8_t llMode = llRLE ? 1 : 2;
+    uint8_t ofMode = ofRLE ? 1 : 2;
+    uint8_t mlMode = mlRLE ? 1 : 2;
+    dst[pos++] = (llMode << 6) | (ofMode << 4) | (mlMode << 2);
 
-    for (uint32_t i = 0; i < n_seqs; i++) {
-        uint8_t lc = ll_code(my_seqs[i].literal_length);
-        uint8_t mc = ml_code(my_seqs[i].match_length);
-        uint8_t oc = (uint8_t)highbit32(my_seqs[i].offset + 3);
-        llCodes[i] = lc; mlCodes[i] = mc; ofCodes[i] = oc;
-        if (lc < llMin) llMin = lc; if (lc > llMax) llMax = lc;
-        if (mc < mlMin) mlMin = mc; if (mc > mlMax) mlMax = mc;
-        if (oc < ofMin) ofMin = oc; if (oc > ofMax) ofMax = oc;
+    // --- Table descriptions / RLE symbols (order: LL, OF, ML) ---
+    // Mode 0 (Predefined) needs no table desc. Mode 1 (RLE) needs 1 byte. Mode 2 (FSE) needs table.
+    if (llMode == 1) { dst[pos++] = llMin; }
+    else if (llMode == 2) {
+        uint8_t tmp[128];
+        uint32_t tblBytes = fse_write_table_desc(tmp, llNC, (int)llMax, llALog);
+        for (uint32_t i = 0; i < tblBytes; i++) dst[pos++] = tmp[i];
+    }
+    // mode 0: no table description needed
+
+    if (ofMode == 1) { dst[pos++] = ofMin; }
+    else if (ofMode == 2) {
+        uint8_t tmp[128];
+        uint32_t tblBytes = fse_write_table_desc(tmp, ofNC, (int)ofMax, ofALog);
+        for (uint32_t i = 0; i < tblBytes; i++) dst[pos++] = tmp[i];
     }
 
-    // Use RLE mode when all codes are uniform, otherwise fall back to raw block
-    // (FSE_Compressed mode is WIP — cumul offset bug for zero-prob symbols)
-    uint8_t llRLE = (llMin == llMax);
-    uint8_t ofRLE = (ofMin == ofMax);
-    uint8_t mlRLE = (mlMin == mlMax);
+    if (mlMode == 1) { dst[pos++] = mlMin; }
+    else if (mlMode == 2) {
+        uint8_t tmp[128];
+        uint32_t tblBytes = fse_write_table_desc(tmp, mlNC, (int)mlMax, mlALog);
+        for (uint32_t i = 0; i < tblBytes; i++) dst[pos++] = tmp[i];
+    }
 
-    if (!llRLE || !ofRLE || !mlRLE) {
-        // Can't encode with RLE — fall back to raw block
+    // Bounds check after headers
+    if (pos >= safe_limit) goto fallback_raw;
+
+    // --- Encode sequences bitstream ---
+    {
+        BitStream bs;
+        bs_init(&bs, dst, pos);
+
+        uint32_t last = n_seqs - 1;
+
+        // Recompute codes for last sequence
+        uint8_t lastLL = ll_code(my_seqs[last].literal_length);
+        uint8_t lastML = ml_code(my_seqs[last].match_length);
+        uint8_t lastOF = of_code(my_seqs[last].offset);
+
+        // Initialize FSE states (no bits output)
+        uint32_t stateLL = 0, stateOF = 0, stateML = 0;
+        if (!llRLE) stateLL = fse_init_state(lastLL, &llTbl);
+        if (!ofRLE) stateOF = fse_init_state(lastOF, &ofTbl);
+        if (!mlRLE) stateML = fse_init_state(lastML, &mlTbl);
+
+        // First sequence (last in array): extra bits only, no FSE state bits
+        {
+            uint8_t llBits = LL_bits[lastLL];
+            if (llBits > 0)
+                bs_addBits(&bs, my_seqs[last].literal_length - LL_baseline[lastLL], llBits);
+
+            uint8_t mlBits = ML_bits[lastML];
+            if (mlBits > 0)
+                bs_addBits(&bs, (my_seqs[last].match_length + 3) - ML_baseline[lastML], mlBits);
+
+            uint8_t ofBits = lastOF;
+            if (ofBits > 0)
+                bs_addBits(&bs, (my_seqs[last].offset + 3) - (1u << ofBits), ofBits);
+
+            bs_flush(&bs);
+
+        }
+
+        // Remaining sequences backward: FSE state bits then extra bits
+        for (int32_t n = (int32_t)n_seqs - 2; n >= 0; n--) {
+            if (bs.pos >= safe_limit) goto fallback_raw;
+
+            uint8_t lc = ll_code(my_seqs[n].literal_length);
+            uint8_t mc = ml_code(my_seqs[n].match_length);
+            uint8_t oc = of_code(my_seqs[n].offset);
+
+            // FSE state bits: OF, ML, LL order (written forward, decoder reads backward as LL, ML, OF)
+            if (!ofRLE) fse_encode_symbol(&bs, &stateOF, oc, &ofTbl);
+            if (!mlRLE) fse_encode_symbol(&bs, &stateML, mc, &mlTbl);
+            if (!llRLE) fse_encode_symbol(&bs, &stateLL, lc, &llTbl);
+
+            bs_flush(&bs);
+
+            // Extra bits: LL, ML, OF order
+            uint8_t llBits = LL_bits[lc];
+            if (llBits > 0)
+                bs_addBits(&bs, my_seqs[n].literal_length - LL_baseline[lc], llBits);
+
+            uint8_t mlBits = ML_bits[mc];
+            if (mlBits > 0)
+                bs_addBits(&bs, (my_seqs[n].match_length + 3) - ML_baseline[mc], mlBits);
+
+            uint8_t ofBits = oc;
+            if (ofBits > 0)
+                bs_addBits(&bs, (my_seqs[n].offset + 3) - (1u << ofBits), ofBits);
+
+            bs_flush(&bs);
+        }
+
+        // Flush final FSE states: ML, OF, LL order (per reference encoder)
+        // States are in [tableSize, 2*tableSize-1]; mask to accuracyLog bits
+        // to produce the decoder's initial state value in [0, tableSize-1].
+        if (!mlRLE) bs_addBits(&bs, stateML & ((1u << mlTbl.accuracyLog) - 1), mlTbl.accuracyLog);
+        if (!ofRLE) bs_addBits(&bs, stateOF & ((1u << ofTbl.accuracyLog) - 1), ofTbl.accuracyLog);
+        if (!llRLE) bs_addBits(&bs, stateLL & ((1u << llTbl.accuracyLog) - 1), llTbl.accuracyLog);
+
+        uint32_t seqDataEnd = bs_close(&bs);
+
+        if (seqDataEnd >= max_frame_size) goto fallback_raw;
+
+        uint32_t block_content_size = seqDataEnd - (block_header_pos + 3);
+
+        if (block_content_size >= this_chunk_size) goto fallback_raw;
+
+        // Write compressed block header
+        uint32_t bh = 1u | (ZSTD_BLOCK_TYPE_COMPRESSED << 1) | (block_content_size << 3);
+        dst[block_header_pos + 0] = (uint8_t)bh;
+        dst[block_header_pos + 1] = (uint8_t)(bh >> 8);
+        dst[block_header_pos + 2] = (uint8_t)(bh >> 16);
+
+        output_sizes[chunk_idx] = seqDataEnd;
+        return;
+    }
+
+fallback_raw:
+    {
         pos = block_header_pos;
         const uint8_t* src = input + chunk_start;
         uint32_t bh = 1u | (ZSTD_BLOCK_TYPE_RAW << 1) | (this_chunk_size << 3);
@@ -814,63 +1035,4 @@ extern "C" __global__ void zstd_encode_block(
         output_sizes[chunk_idx] = pos;
         return;
     }
-
-    // Mode byte: all RLE (01)
-    dst[pos++] = (1u << 6) | (1u << 4) | (1u << 2); // 0x54
-    dst[pos++] = llMin; // LL RLE symbol
-    dst[pos++] = ofMin; // OF RLE symbol
-    dst[pos++] = mlMin; // ML RLE symbol
-
-    // Bitstream: only extra bits (RLE = 0 FSE bits per symbol, AccuracyLog=0)
-    BitStream bs;
-    bs_init(&bs, dst, pos);
-
-    uint32_t last = n_seqs - 1;
-
-    // Extra bits for last sequence: LL, ML, OF
-    uint8_t eb;
-    eb = LL_bits[llCodes[last]];
-    if (eb > 0) bs_addBits(&bs, my_seqs[last].literal_length - LL_baseline[llCodes[last]], eb);
-    eb = ML_bits[mlCodes[last]];
-    if (eb > 0) bs_addBits(&bs, (my_seqs[last].match_length + 3) - ML_baseline[mlCodes[last]], eb);
-    eb = ofCodes[last];
-    if (eb > 0) bs_addBits(&bs, (my_seqs[last].offset + 3) - (1u << eb), eb);
-    bs_flush(&bs);
-
-    // Remaining sequences backward (RLE = 0 FSE bits, only extra bits)
-    for (int32_t n = (int32_t)n_seqs - 2; n >= 0; n--) {
-        eb = LL_bits[llCodes[n]];
-        if (eb > 0) bs_addBits(&bs, my_seqs[n].literal_length - LL_baseline[llCodes[n]], eb);
-        eb = ML_bits[mlCodes[n]];
-        if (eb > 0) bs_addBits(&bs, (my_seqs[n].match_length + 3) - ML_baseline[mlCodes[n]], eb);
-        eb = ofCodes[n];
-        if (eb > 0) bs_addBits(&bs, (my_seqs[n].offset + 3) - (1u << eb), eb);
-        bs_flush(&bs);
-    }
-
-    // RLE: no state bits to flush (AccuracyLog=0)
-    uint32_t seqDataEnd = bs_close(&bs);
-
-    // Now we know the compressed block size
-    uint32_t block_content_size = seqDataEnd - (block_header_pos + 3);
-
-    // Check if compressed block is actually smaller than raw
-    if (block_content_size >= this_chunk_size) {
-        // Compressed is bigger — fall back to raw block
-        pos = block_header_pos;
-        const uint8_t* src = input + chunk_start;
-        uint32_t bh = 1u | (ZSTD_BLOCK_TYPE_RAW << 1) | (this_chunk_size << 3);
-        dst[pos++] = (uint8_t)bh; dst[pos++] = (uint8_t)(bh>>8); dst[pos++] = (uint8_t)(bh>>16);
-        for (uint32_t i = 0; i < this_chunk_size; i++) dst[pos++] = src[i];
-        output_sizes[chunk_idx] = pos;
-        return;
-    }
-
-    // Write compressed block header
-    uint32_t bh = 1u | (ZSTD_BLOCK_TYPE_COMPRESSED << 1) | (block_content_size << 3);
-    dst[block_header_pos + 0] = (uint8_t)bh;
-    dst[block_header_pos + 1] = (uint8_t)(bh >> 8);
-    dst[block_header_pos + 2] = (uint8_t)(bh >> 16);
-
-    output_sizes[chunk_idx] = seqDataEnd;
 }

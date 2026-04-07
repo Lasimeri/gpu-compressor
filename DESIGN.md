@@ -2,588 +2,378 @@
 
 ## project overview
 
-gpu-compressor is a GPU-accelerated file compression tool built in Rust. It leverages NVIDIA's nvCOMP library for batched GPU compression/decompression and includes two custom CUDA kernels — one for BLAKE3 hashing and one for Zstd compression. The tool supports single and dual GPU operation, streaming pipelines, multi-file async processing, and directory-recursive compression with integrity verification.
+gpu-compressor is a GPU-accelerated file compression tool built in Rust. It supports two algorithms — Zstd and LZMA2 — each with multiple levels that progressively shift work from library routines to custom GPU kernels and custom entropy coders. It handles single and dual GPU operation, streaming pipelines with crossbeam backpressure, multi-file async processing, and directory-recursive compression.
 
-**Language:** Rust (2021 edition) + CUDA C++  
-**Runtime:** Tokio (async I/O, multi-threaded) + raw threads (pipeline stages)  
-**GPU interface:** cudarc (high-level) + cuda-runtime-sys (low-level FFI) + nvCOMP (compression API)  
-**Build:** Cargo + bindgen (FFI generation) + nvcc (CUDA compilation)
+**Language:** Rust (2021 edition) + CUDA C++
+**Runtime:** Tokio (async I/O, multi-file orchestration) + raw threads (pipeline stages)
+**GPU interface:** cudarc (high-level kernel launch) + cuda-runtime-sys (FFI) + nvCOMP (compression API)
+**Build:** Cargo + bindgen (FFI generation) + nvcc (CUDA PTX compilation)
 
 ## module dependency graph
 
 ```
-                          ┌──────────┐
-                          │ main.rs  │
-                          └────┬─────┘
-                               │
-              ┌────────────────┼────────────────────────┐
-              │                │                        │
-         ┌────▼────┐    ┌─────▼──────┐          ┌──────▼──────┐
-         │ cli.rs  │    │dispatch.rs │          │decompress.rs│
-         └─────────┘    └─────┬──────┘          └──────┬──────┘
-                              │                        │
-           ┌──────────┬───────┼──────────┬─────────────┤
-           │          │       │          │             │
-     ┌─────▼────┐ ┌───▼────┐ │  ┌───────▼────────┐   │
-     │pipeline. │ │pipeline│ │  │compress_zstd   │   │
-     │  rs      │ │_dual.rs│ │  │  _custom.rs    │   │
-     └─────┬────┘ └───┬────┘ │  └───────┬────────┘   │
-           │          │      │          │             │
-     ┌─────▼──────────▼──────▼──────────▼─────────────▼─────┐
-     │                  shared modules                       │
-     │  blake3.rs  compress_zstd.rs  compress_gdeflate.rs   │
-     │  cuda.rs    constants.rs      format.rs              │
-     │  multi.rs   nvcomp_bindings.rs                       │
-     └──────────────────────────────────────────────────────┘
-                              │
-                    ┌─────────▼──────────┐
-                    │   CUDA kernels     │
-                    │  blake3.ptx        │
-                    │  zstd_compress.ptx │
-                    └────────────────────┘
+                        ┌──────────┐
+                        │ main.rs  │
+                        └────┬─────┘
+                             │
+            ┌────────────────┼───────────────────────┐
+            │                │                       │
+       ┌────▼────┐    ┌──────▼──────┐        ┌──────▼──────┐
+       │ cli.rs  │    │ dispatch.rs │        │decompress.rs│
+       └─────────┘    └──────┬──────┘        └──────┬──────┘
+                             │                      │
+        ┌────────────────────┼──────────────┐       │
+        │          │         │              │       │
+  ┌─────▼────┐ ┌───▼────┐ ┌─▼────────────┐ │       │
+  │pipeline. │ │pipeline│ │pipeline_lzma2│ │       │
+  │  rs      │ │_dual.rs│ │   .rs        │ │       │
+  └─────┬────┘ └───┬────┘ └──────┬───────┘ │       │
+        │          │             │          │       │
+  ┌─────▼──────────▼─────────────▼──────────▼───────▼──────┐
+  │                       shared modules                    │
+  │  compress_zstd.rs   compress_zstd_custom.rs             │
+  │  compress_lzma2.rs  compress_lzma2_custom.rs            │
+  │  cuda.rs  constants.rs  format.rs  tui.rs               │
+  │  multi.rs  nvcomp_bindings.rs                           │
+  └──────────────────────────────────────────────────────────┘
+                             │
+                   ┌─────────▼──────────┐
+                   │    CUDA kernels    │
+                   │  zstd_compress.ptx │
+                   │  lzma2_match_find.ptx │
+                   └────────────────────┘
 ```
+
+Note: `pipeline_lzma2_dual.rs` exists but is not used — `pipeline_lzma2.rs` handles multi-GPU via MPMC channels internally.
 
 ## module descriptions
 
 ### entry point
 
-**main.rs** — Parses CLI via clap, routes to the appropriate handler based on subcommand (Compress, CompressMulti, Decompress, DecompressMulti, Hash). Uses `tokio::main` for the async runtime. Force-exits via `std::process::exit(0)` after completion to avoid CUDA driver segfaults during tokio shutdown.
+**main.rs** — Parses CLI via clap, routes to the appropriate handler. Uses `tokio::main`. Two subcommands: `Compress` and `Decompress`. Algorithm selection (`zstd` vs `lzma2`) is a string argument checked with `algorithm == "lzma2"`. `dict_size` flag present in CLI struct and passed through to `compress_file_lzma2`. Multi-file Zstd L0 routes to the async `compress_multi_files_async` path; all other cases iterate sequentially.
 
 ### CLI
 
-**cli.rs** — Defines the argument schema using clap derive macros.
+**cli.rs** — Clap derive macro definitions.
 
-- `Algorithm` enum: `Gdeflate` | `Zstd` (accepts aliases: "deflate", "zstandard")
-- `Commands` enum: five subcommands with typed parameters
-- Compression level (`-l`): u32, default 0. Only meaningful for Zstd.
-- Chunk size (`--chunk-size`): usize for compress-multi, default 128 MB
+- `Commands` enum: `Compress` and `Decompress`
+- `Compress` fields: `input: Vec<PathBuf>`, `output: Option<PathBuf>`, `algorithm: String` (default `"zstd"`), `device: i32` (default `0`), `level: u32` (default `0`), `chunk_size: usize` (default 128 MiB), `dict_size: u32` (default `128` MiB)
+- `Decompress` fields: `input: Vec<PathBuf>`, `output: Option<PathBuf>`, `device: i32` (default `0`)
+- Output naming helpers: `auto_compress_output_zstd` appends `.nvzs`; `auto_compress_output_lzma2` appends `.nvlz`; `auto_decompress_output` strips `.nvzs`/`.nvlz`, appends `.out` for unknowns
 
 ### compression dispatch
 
-**dispatch.rs** — Central routing layer. Determines which compression pipeline to invoke based on algorithm, level, file size, and GPU count.
+**dispatch.rs** — Central routing.
 
-Decision tree:
 ```
-compress_file(input, output, algo, device, level)
+compress_file(input, output, device, level)      [Zstd]
   │
-  ├─ algo = Zstd
-  │   ├─ level > 0 → compress_file_custom_zstd()
-  │   │                (custom CUDA kernel, single GPU)
-  │   ├─ gpu_count >= 2 → compress_file_streaming_dual_gpu()
-  │   │                    (nvCOMP, dual GPU pipeline)
-  │   └─ gpu_count == 1 → compress_file_streaming_zstd()
-  │                        (nvCOMP, single GPU pipeline)
+  ├─ level == 0 AND gpus >= 2 → compress_file_streaming_dual_gpu()
+  └─ otherwise → compress_file_streaming_zstd()
+      (level > 0 forces single GPU regardless of GPU count)
+
+compress_file_lzma2(input, output, device, level, dict_size_mb) [LZMA2]
   │
-  ├─ algo = Gdeflate
-  │   ├─ size > 2 GB → compress_large_file_in_chunks()
-  │   │                 (NVMC wrapper, 128 MB sub-files)
-  │   └─ size ≤ 2 GB → compress_buffer_gdeflate()
-  │                      (single-shot buffered)
-  │
-  └─ directory input → compress_directory()
-                        Phase 1: hash all files (GPU BLAKE3)
-                        Phase 2: compress each file (above logic)
+  └─ compress_file_streaming_lzma2(gpu_ids=all_available, ...)
+      (single pipeline handles both single and multi-GPU via MPMC internals)
+
+compress_directory(input_dir, output_dir, device, level)
+  → WalkDir traverse + compress_file_impl() per file [Zstd only]
 ```
 
-**expand_directory_inputs()** — WalkDir traversal that maps input paths to output paths preserving directory structure, appending algorithm-specific extensions.
+`expand_directory_inputs()` — WalkDir traversal mapping directory input to individual files, preserving relative paths, appending the appropriate extension.
+
+`compress_file_impl()` — Resolves output path, detects GPU count, routes to streaming pipeline.
 
 ### streaming pipelines
 
-#### pipeline.rs — single GPU (Zstd level 0)
+#### pipeline.rs — single GPU Zstd
 
-Three-thread producer-consumer pipeline connected by bounded crossbeam channels:
+3-thread structure: reader → compressor → writer, connected by bounded crossbeam channels.
 
-```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│  Tar Generator   │────▶│  GPU Compressor  │────▶│     Writer       │
-│  (read thread)   │     │  (compress thread)│    │  (write thread)  │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-         │                        │                        │
-    Reads input file       nvCOMP Zstd batch         Writes NVZS header
-    Builds tar archive     compress per chunk         + chunk sizes table
-    Streams 4 MB chunks    on GPU device              + compressed data
-    Includes .blake3                                  + .blake3 sidecar
-```
+Level routing in the compressor thread: `if level > 0 { compress_chunk_zstd_custom(...) } else { compress_chunk_zstd(...) }`.
 
-A fourth stats thread monitors atomic counters (read bytes, GPU bytes, write bytes) and displays live throughput via indicatif spinners.
-
-**Backpressure:** channels are bounded to `PIPELINE_QUEUE_SIZE` (16). If the writer falls behind, the compressor blocks; if the compressor falls behind, the reader blocks.
-
-**Buffer sizes:** 8 MB BufReader and BufWriter for SSD throughput saturation.
-
-#### pipeline_dual.rs — dual GPU (Zstd level 0)
-
-Six-thread pipeline with chunk interleaving:
+#### pipeline_dual.rs — dual GPU Zstd (L0 only)
 
 ```
-                          ┌─────────────────┐
-                     ┌───▶│  GPU 0 Thread   │───┐
-                     │    │  (even chunks)  │   │
-┌──────────────┐     │    └─────────────────┘   │    ┌──────────────┐
-│ Tar Generator│─────┤                          ├───▶│    Writer    │
-│ (reader)     │     │    ┌─────────────────┐   │    │ (reorderer)  │
-└──────────────┘     └───▶│  GPU 1 Thread   │───┘    └──────────────┘
-                          │  (odd chunks)   │
-                          └─────────────────┘
+Reader → even chunks → GPU 0 thread → CompressedChunk → Writer (BTreeMap reorder)
+       → odd chunks  → GPU 1 thread → CompressedChunk ↗
 ```
 
-- Reader distributes via `batch_index % 2` to separate channels per GPU
-- Both GPU threads compress via nvCOMP and send to a shared writer channel
-- Writer maintains a `BTreeMap<usize, CompressedChunk>` for reordering
-- Writes chunks sequentially by tracking `next_chunk_to_write`
+Reader distributes by `chunk_index % 2` to per-GPU channels. Writer uses `BTreeMap<usize, CompressedChunk>` to reorder before writing.
+
+#### pipeline_lzma2.rs — LZMA2 (single + multi-GPU, all levels)
+
+Handles both L0 and L1+ internally. Accepts `gpu_ids: &[i32]` — all detected GPUs are passed in.
+
+**L0 path:**
+```
+Reader thread → [bounded channel, 4 slots] → N CPU workers (liblzma, min(num_cpus, 8))
+  → [bounded compressed channel, 8 slots] → Writer thread
+```
+
+Each worker pulls whole chunks from the read channel and calls `compress_chunk_lzma2()`. Pipeline chunk size = `dict_size_mb * 1024 * 1024` (dictionary window equals chunk size).
+
+**L1+ path (async GPU→CPU pipeline):**
+```
+Reader thread
+  → [bounded channel, 4 slots]
+  → GPU match finding thread(s) [1 per GPU, each consumes PipelineMsg::Chunk via MPMC]
+      → sub-block jobs [bounded job queue, num_cpus*4 slots]
+  → N CPU encoder threads [min(num_cpus, 8), each grabs SubBlockJobs independently]
+      → (chunk_index, sub_index, total_subs, encoded_block) [result channel]
+  → Collector thread [HashMap pending, reassembles sub-blocks into CompressedChunks]
+      → [bounded compressed channel, 8 slots]
+  → Writer thread [BTreeMap reorder, NVLZ header + size table + data]
+```
+
+Key property: GPU runs ahead of CPU encoders. The bounded job queue (N*4 slots) provides backpressure. CPU encoders are truly parallel — each grabs one 64 KB sub-block at a time from the shared Arc<Receiver>. Multiple GPUs each have their own thread consuming from the shared MPMC read channel (crossbeam allows multiple receivers).
+
+Writer uses `BTreeMap<usize, CompressedChunk>` to reorder out-of-order completions. For L1+, NVLZ `chunk_size` field is set to `LZMA2_CUSTOM_CHUNK_SIZE` (64 KB); for L0, it's the pipeline chunk size.
+
+#### pipeline_lzma2_dual.rs — legacy, unused
+
+Earlier dual GPU design. Superseded by `pipeline_lzma2.rs` which handles multi-GPU natively via MPMC. Kept for reference only.
 
 ### compression engines
 
-#### compress_zstd.rs — nvCOMP Zstd (level 0)
+#### compress_zstd.rs — nvCOMP Zstd (L0)
 
-Thin wrapper around nvCOMP's batched Zstd API for single-chunk operation:
-1. Allocate device memory for one 4 MB chunk
-2. Call `nvcompBatchedZstdCompressAsync` 
-3. Synchronize and download compressed result
-4. Returns `(Vec<Vec<u8>>, Vec<usize>)` — compressed sub-chunks and their sizes
+Thin wrapper around nvCOMP's batched Zstd API for a single chunk. Allocates device memory, calls `nvcompBatchedZstdCompressAsync`, synchronizes, downloads result.
 
-Used by both single and dual GPU pipelines per-chunk.
+#### compress_zstd_custom.rs — GPU match finding + CPU FSE (L1/L2)
 
-#### compress_zstd_custom.rs — custom CUDA kernel (levels 1-2)
+Two-pass per chunk:
 
-Orchestrates the custom Zstd CUDA kernel pipeline:
+1. **GPU pass:** `zstd_match_find` kernel across all 64 KB sub-chunks in parallel. LZ77 with 14-bit shared-memory hash table (16K entries). Search depth 16 (L1) or 64 (L2). Output: sequence array (lit_len, match_len_minus3, offset) + seq_counts.
 
-```
-Input 4 MB chunk
-  │
-  ├─ Split into 64 KB sub-chunks
-  │
-  ├─ Level 0 fallback → zstd_compress_raw kernel
-  │   (wraps each sub-chunk as a Zstd raw frame)
-  │
-  └─ Level 1+ → two-pass pipeline:
-      │
-      ├─ Pass 1: zstd_match_find kernel
-      │   - LZ77 match finding per sub-chunk
-      │   - 14-bit shared-memory hash table (16K entries)
-      │   - Lazy matching (depth 16) or optimal (depth 64)
-      │   - Output: sequence array + literal bytes per sub-chunk
-      │
-      └─ Pass 2: zstd_encode_block kernel
-          - FSE encoding of sequences + literals
-          - Predefined FSE tables from RFC 8878
-          - RLE-mode for uniform-symbol chunks
-          - Output: valid Zstd compressed frames
-          - Fallback: raw block if compressed >= original
-```
+2. **CPU pass:** `ZSTD_compressSequences` (libzstd FFI) per sub-chunk. Converts GPU sequences to `ZstdSequence` structs, produces a valid Zstd frame. Falls back to `ZSTD_compress(level=1)` on error.
 
-Each sub-chunk becomes an independent Zstd frame. Multiple frames are concatenated to form the 4 MB chunk payload stored in NVZS format. nvCOMP's standard Zstd decompressor handles multi-frame chunks natively.
+Sub-chunk frames are concatenated; nvCOMP's decompressor handles multi-frame input natively.
 
-#### compress_gdeflate.rs — nvCOMP Gdeflate
+#### compress_lzma2.rs — liblzma FFI (L0)
 
-Buffered (non-streaming) compression:
-1. Split input into 64 KB chunks
-2. Batch chunks into 128 MB GPU batches
-3. Per batch: upload → nvCOMP Gdeflate compress → download
-4. Write NVGD header + chunk size table + concatenated compressed data
+liblzma loaded at runtime via `dlopen("liblzma.so.5")`. Resolves `lzma_raw_encoder`, `lzma_code`, `lzma_end`, `lzma_lzma_preset`. Each chunk encoded as a raw LZMA2 stream at the specified preset (0-9). Also provides `decompress_chunk_lzma2` used by `decompress.rs`. The `_dict_size` parameter is currently unused (passed through but liblzma uses the preset-configured dict size).
+
+#### compress_lzma2_custom.rs — GPU HC4 + range coder (L1+)
+
+Two functions: `gpu_find_matches` and `encode_single_sub_block`.
+
+`gpu_find_matches(data, device_id)` → `MatchResults`:
+- Loads `lzma2_match_find` PTX kernel via cudarc
+- Grid: one block per 64 KB sub-block; HC4 (hash chain depth 4) match finding
+- LZMA2_HC4_SEARCH_DEPTH = 32 probes per position, LZMA2_MAX_MATCHES_PER_POS = 8 candidates
+- Returns: `match_distances: Vec<u32>`, `match_lengths: Vec<u32>`, `match_counts: Vec<u32>`, `sub_block_size`, `max_matches`, `num_sub_blocks`
+
+`encode_single_sub_block(sub_data, distances, lengths, counts, max_matches)` → `Vec<u8>`:
+- Custom Rust LZMA range coder (full LZMA probability model)
+- `RangeCoder` struct: range/cache/cache_size/low arithmetic encoding
+- `encode_bit`, `encode_bit_tree`, `encode_bit_tree_reverse`
+- Match encoding edge cases handled with verification fallback to raw blocks
 
 ### multi-file compression
 
-**multi.rs** — Tokio-based async pipeline for concurrent multi-file processing.
-
-```
-┌────────────┐    ┌────────────┐
-│ Reader 1   │───▶│            │    ┌────────────────┐    ┌──────────┐
-│ (file 1)   │    │  Shared    │───▶│ GPU Compressor │───▶│ Writer 1 │
-└────────────┘    │  Channel   │    │ (blocking task) │   └──────────┘
-┌────────────┐    │            │    │ 9 chunks/batch  │   ┌──────────┐
-│ Reader 2   │───▶│ (file_idx, │    └────────────────┘───▶│ Writer 2 │
-│ (file 2)   │    │  chunk)    │                          └──────────┘
-└────────────┘    └────────────┘
-```
-
-- Max 2 files processed concurrently
-- Reader tasks are async (tokio::fs)
-- GPU compressor is a blocking task that batches 9 chunks from any file
-- Per-file writer tasks receive chunks via dedicated channels
-- Interleaving chunks from multiple files maximizes GPU utilization
+**multi.rs** — Tokio async pipeline for concurrent Zstd L0 compression.
+- Max 2 files concurrently
+- Reader tasks: async `tokio::fs`
+- GPU compressor: blocking task
+- Per-file writer tasks receive via dedicated channels
+- Only used for Zstd L0 with 2+ input files
 
 ### decompression
 
-**decompress.rs** — Format auto-detection via 4-byte magic header:
+**decompress.rs** — Format detection by 4-byte magic:
 
 | Magic | Handler | Strategy |
 |-------|---------|----------|
-| `NVZS` | `decompress_file_zstd_streaming()` | Micro-batch (1 chunk), tar extract, BLAKE3 verify |
-| `NVGD` | `decompress_file_gdeflate()` | Load all chunks, single GPU batch decompress |
-| `NVMC` | `decompress_multi_chunk_file()` | Process each sub-archive independently |
+| `NVZS` | `decompress_file_zstd_streaming()` | nvCOMP batched Zstd, per-chunk GPU decompress |
+| `NVLZ` | `decompress_file_lzma2_streaming()` | liblzma raw decoder per chunk |
 
-**Zstd decompression detail:**
-1. Read header → parse chunk count and sizes
-2. For each chunk: read compressed → upload to GPU → nvCOMP decompress → download → append to temp .tar
-3. Extract tar → recover original file + `.blake3` sidecar
-4. Hash decompressed file on GPU → compare to stored hash
-5. If mismatch: retry with `blake3_hash_file_legacy()` (backward compat for old BLAKE3 chunk flag bug)
-6. Clean up temp files
+Both read the 28-byte header (re-reading from position 0 after magic check), read the N×8 size table, then process chunks sequentially.
+
+**Zstd decompression:** chunk → upload to GPU → `nvcompBatchedZstdDecompressAsync` → sync → download → write
+
+**LZMA2 decompression:** chunk → `decompress_chunk_lzma2()` (liblzma raw decoder, 64 MB dict window) → write
+
+No tar wrapping, no integrity verification. Output is raw decompressed bytes.
 
 ### GPU utilities
 
-**cuda.rs** — Safe wrapper around `cudaGetDeviceCount` and `cudaGetDeviceProperties`. Returns `Vec<i32>` of device IDs. Properly scoped unsafe blocks with error checking on every CUDA call.
+**cuda.rs** — `detect_gpus()` calls `cudaGetDeviceCount` and `cudaGetDeviceProperties`. Uses `cudaDeviceProp` from `nvcomp_bindings` rather than `cuda-runtime-sys` to avoid the 296-byte size mismatch bug in `cuda-runtime-sys 0.3.0-alpha.1` on CUDA 13.x. Returns `Vec<i32>` of device IDs and prints device names to stderr.
 
-**nvcomp_bindings.rs** — Auto-generated via bindgen from `wrapper.h` at build time. Includes all nvCOMP API functions for Gdeflate, Zstd, Bitcomp, and LZ4.
+**nvcomp_bindings.rs** — Auto-generated via bindgen from `wrapper.h`. Includes nvCOMP API functions for Zstd. The generated `cudaDeviceProp` struct has the correct CUDA 13.x size (1008 bytes).
 
 ### shared types and constants
 
-**format.rs** — Pipeline message types:
-- `PipelineMsg::Chunk { data: Vec<u8>, chunk_index: usize }` — a chunk to compress
-- `PipelineMsg::Done` — signal end of input
-- `CompressedChunk` — compressed output with sub-chunk data and sizes
+**format.rs:**
+- `PipelineMsg::Chunk { data: Vec<u8>, chunk_index: usize }` — chunk to compress
+- `PipelineMsg::Done` — end-of-input sentinel
+- `CompressedChunk { chunks: Vec<Vec<u8>>, chunk_index: usize, compressed_sizes: Vec<u64> }` — output
 
-**constants.rs** — All tunable parameters:
+**constants.rs:**
+
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `CHUNK_SIZE` | 64 KB | Gdeflate chunk size |
-| `ZSTD_CHUNK_SIZE` | 4 MB | Zstd streaming chunk size |
-| `BATCH_SIZE` | 128 MB | Gdeflate GPU batch size |
-| `MAX_FILE_CHUNK_SIZE` | 128 MB | Multi-chunk file split size |
-| `PIPELINE_QUEUE_SIZE` | 16 | Channel backpressure depth |
-| `BLAKE3_CHUNK_SIZE` | 1 KB | Per-thread GPU hash chunk |
-| `GDEFLATE_MAX_SIZE` | ~2 GB | Gdeflate single-file limit |
-| `CUSTOM_ZSTD_CHUNK_SIZE` | 64 KB | Custom kernel sub-chunk size |
-| `CUSTOM_ZSTD_SEARCH_DEPTH_LAZY` | 16 | Level 1 match search depth |
+| `ZSTD_CHUNK_SIZE` | 8 MB | Zstd pipeline chunk size |
+| `CUSTOM_ZSTD_CHUNK_SIZE` | 64 KB | Zstd sub-chunk for GPU match finding |
+| `CUSTOM_ZSTD_SEARCH_DEPTH_LAZY` | 16 | L1 match search depth |
+| `LZMA2_CHUNK_SIZE` | 8 MB | (reference; actual chunk size = dict_size_mb * 1024 * 1024) |
+| `LZMA2_CUSTOM_CHUNK_SIZE` | 64 KB | LZMA2 sub-block for GPU HC4 |
+| `LZMA2_HC4_SEARCH_DEPTH` | 32 | GPU HC4 chain probe depth |
+| `LZMA2_MAX_MATCHES_PER_POS` | 8 | Max match candidates per position |
+| `LZMA2_DICT_SIZE` | 16 MB | (dead_code, unused) |
+| `LZMA2_DEFAULT_PRESET` | 6 | (dead_code, unused) |
+| `PTX_ZSTD_COMPRESS` | embedded | `include_str!("../zstd_compress.ptx")` |
+| `PTX_LZMA2_MATCH_FIND` | embedded | `include_str!("../lzma2_match_find.ptx")` |
 
-PTX kernels (`blake3.ptx`, `zstd_compress.ptx`) are embedded via `include_str!` at compile time.
+**tui.rs** — `TuiState` struct with `Arc<AtomicU64>` counters (bytes_read, bytes_compressed, bytes_written, chunk_gpu0, chunk_gpu1 optional). Renders via ANSI escape codes; cursor-up on redraw to overwrite previous lines. `quiet` flag suppresses output. `print_summary()` called at end of compression.
 
 ## CUDA kernel design
 
-### blake3.cu — GPU BLAKE3 hashing
+### zstd_compress.cu — Zstd match finding
 
-Two kernels:
+**`zstd_match_find`** — active, loaded by `compress_zstd_custom.rs`
+- Grid: one block per 64 KB sub-chunk; Block: 256 threads (thread 0 does sequential scan, others idle)
+- Hash table: 16K entries, 14-bit multiplicative hash on 4-byte windows, in shared memory
+- Lazy matching: at each position, checks if next position yields a longer match (configurable `search_depth`)
+- Tracks repeat offsets per RFC 8878
+- Output per sub-chunk: sequence array (lit_len u32, match_len_minus3 u32, offset u32) + seq_count
 
-**`blake3_hash_chunks`** — per-chunk hashing
-- One thread per 1 KB BLAKE3 chunk
-- 256 threads/block, dynamic grid sizing
-- Each thread: loads 1 KB, runs BLAKE3 compression function (7 rounds) on two 64-byte blocks
-- Flags: `CHUNK_START` on block 0 only (fixed in v2; legacy mode sets it on all blocks)
-- Output: 32-byte chaining value per chunk
-- Constants (IV, permutation schedule) in CUDA constant memory
+**`zstd_compress_raw`** and **`zstd_encode_block`** — present in source, not loaded:
+- `zstd_compress_raw`: wraps sub-chunks as raw Zstd frames (no compression)
+- `zstd_encode_block`: GPU FSE encoder; has a known bug in FSE_Compressed mode — CPU path via `ZSTD_compressSequences` is used instead
 
-**`blake3_reduce_tree`** — tree reduction
-- Pairwise combines chunk hashes: hash[2i] + hash[2i+1] → parent[i]
-- Runs iteratively (log₂ N stages) until one hash remains
-- Each stage: parent flag set, child hashes concatenated, compressed to new chaining value
-- Final output: 256-bit BLAKE3 hash
+### lzma2_match_find.cu — LZMA2 HC4 match finding
 
-**Legacy mode:** A `u32 legacy` parameter is passed to `blake3_hash_chunks`. When set, applies `CHUNK_START` to all blocks (matching the bug in v1). This allows decompression to verify hashes from old .nvzs files.
+- Grid: one block per 64 KB sub-block
+- HC4 (hash + chain depth 4) match finder
+- `LZMA2_HC4_SEARCH_DEPTH` probes per position
+- Output: per-position match candidates (offset, length pairs), up to `LZMA2_MAX_MATCHES_PER_POS`
+- Feeds `encode_single_sub_block` in `compress_lzma2_custom.rs`
 
-### zstd_compress.cu — custom Zstd compression
+### blake3.cu — dead code
 
-Three kernels implementing RFC 8878 (Zstandard) compliant compression:
-
-**`zstd_compress_raw`** — raw frame wrapping
-- One block per sub-chunk
-- Wraps each 64 KB input as a Zstd raw frame (no compression)
-- Header: magic (0xFD2FB528) + frame descriptor + FCS + raw block header + data
-- Used as fallback when match finding produces no benefit
-
-**`zstd_match_find`** — LZ77 match finding
-- One block per 64 KB sub-chunk, thread 0 does sequential scanning
-- **Hash table:** 16K entries in shared memory, 14-bit multiplicative hash on 4-byte windows
-- **Algorithm:** scans input sequentially, probes hash table for matches
-  - Extends matches forward to determine match length
-  - Lazy matching: checks if next position has a longer match (configurable depth)
-  - Tracks 3 repeat offsets per RFC 8878
-- **Output per sub-chunk:**
-  - `Sequence` array: (literal_length, match_length, offset) triples
-  - Literal bytes: raw bytes not covered by matches
-  - `ChunkResult`: counts (compressed size, num sequences, num literals)
-
-**`zstd_encode_block`** — FSE encoding
-- One block per sub-chunk, thread 0 does sequential encoding
-- **Input:** sequences + literals from match finder
-- **Bitstream:** 64-bit accumulator with forward bit writing
-- **Encoding pipeline:**
-  1. Write Zstd frame header (magic, FCS, single segment flag)
-  2. Encode literals section (raw mode — literals copied directly)
-  3. Encode sequences section:
-     - Build frequency tables for literal lengths (LL), match lengths (ML), offsets (OF)
-     - Normalize to power-of-2 table sizes
-     - Spread symbols via FSE table construction
-     - Encode sequences in reverse order (per RFC 8878)
-  4. Finalize block (block header with compressed size, last block flag)
-- **Predefined tables:** RFC 8878 Appendix A predefined FSE distributions for LL, ML, OF
-- **RLE mode:** when all symbols in a category are identical, uses RLE encoding (1-byte table)
-- **Raw fallback:** if compressed block ≥ original size, falls back to raw block
-
-**Data structures:**
-```c
-struct Sequence {
-    uint32_t literal_length;
-    uint32_t match_length;
-    uint32_t offset;
-};
-
-struct ChunkResult {
-    uint32_t compressed_size;
-    uint32_t num_sequences;
-    uint32_t num_literals;
-};
-
-struct BitStream {
-    uint8_t* buffer;
-    uint32_t byte_pos;
-    uint64_t accumulator;
-    uint32_t bits_in_acc;
-};
-
-struct DynFSE {
-    int16_t next_state[MAX_TABLE_SIZE];
-    uint8_t symbol[MAX_TABLE_SIZE];
-    uint8_t num_bits[MAX_TABLE_SIZE];
-    uint32_t table_log;
-    uint32_t table_size;
-};
-```
+Compiles to `blake3.ptx`, no Rust code loads or launches it. Remains from a prior version.
 
 ## file format specifications
 
-### NVZS format (Zstd compressed)
+### NVZS format (Zstd)
 
 ```
 ┌────────────────────────────────────────────┐
 │ Header (28 bytes)                          │
-│   [0:4]   Magic: "NVZS" (4 bytes)         │
-│   [4:12]  Original tar size (u64 LE)       │
-│   [12:20] Chunk size (u64 LE, 4194304)     │
+│   [0:4]   Magic: "NVZS"                   │
+│   [4:12]  Original size (u64 LE)           │
+│   [12:20] Chunk size (u64 LE, 8388608)     │
 │   [20:28] Number of chunks N (u64 LE)      │
 ├────────────────────────────────────────────┤
 │ Chunk Size Table (N × 8 bytes)             │
-│   [28]    Compressed size of chunk 0 (u64) │
-│   [36]    Compressed size of chunk 1 (u64) │
-│   ...     ...                              │
-│   [28+N*8-8] Compressed size of chunk N-1  │
+│   Compressed size of chunk i (u64 LE each) │
 ├────────────────────────────────────────────┤
 │ Compressed Data                            │
-│   Chunk 0 data (sizes[0] bytes)            │
-│   Chunk 1 data (sizes[1] bytes)            │
-│   ...                                      │
-│   Chunk N-1 data (sizes[N-1] bytes)        │
+│   Chunk 0: one Zstd frame (L0) or          │
+│            multiple concatenated frames    │
+│            (one per 64 KB sub-chunk, L1/L2)│
+│   Chunk 1 ... Chunk N-1                    │
 └────────────────────────────────────────────┘
 ```
 
-The decompressed payload is a tar archive containing:
-- `<original_filename>` — the input file
-- `<original_filename>.blake3` — hex-encoded 256-bit BLAKE3 hash
-
-For custom Zstd levels, each chunk may contain multiple concatenated Zstd frames (one per 64 KB sub-chunk), all individually valid per RFC 8878.
-
-### NVGD format (Gdeflate compressed)
-
-Same structure as NVZS but with:
-- Magic: `"NVGD"`
-- Chunk size: typically 65536 (64 KB)
-- Original size: raw file size (no tar wrapping)
-
-### NVMC format (multi-chunk wrapper)
+### NVLZ format (LZMA2)
 
 ```
 ┌────────────────────────────────────────────┐
-│ Header (20 bytes)                          │
-│   [0:4]   Magic: "NVMC" (4 bytes)         │
-│   [4:12]  Original file size (u64 LE)      │
-│   [12:20] Number of sub-archives M (u64)   │
+│ Header (28 bytes)                          │
+│   [0:4]   Magic: "NVLZ"                   │
+│   [4:12]  Original size (u64 LE)           │
+│   [12:20] Chunk size (u64 LE)              │
+│            L0: dict_size_mb × 1048576      │
+│            L1+: 65536 (sub-block size)     │
+│   [20:28] Number of chunks N (u64 LE)      │
 ├────────────────────────────────────────────┤
-│ Sub-archive 0 (complete NVGD)              │
-│   NVGD header + chunks for bytes 0..128MB  │
+│ Chunk Size Table (N × 8 bytes)             │
 ├────────────────────────────────────────────┤
-│ Sub-archive 1 (complete NVGD)              │
-│   NVGD header + chunks for next 128MB      │
-├────────────────────────────────────────────┤
-│ ...                                        │
+│ Compressed Data                            │
+│   L0: each chunk = single raw LZMA2 stream │
+│   L1+: each chunk = concatenated 64KB      │
+│         sub-block streams                  │
 └────────────────────────────────────────────┘
 ```
+
+The size table for L1+ stores per-sub-block sizes (not per pipeline-chunk sizes). The writer iterates `CompressedChunk.chunks` (one entry per sub-block) and writes each size individually.
 
 ## build system
 
 **build.rs** performs three operations:
 
-1. **Bindgen** — parses `wrapper.h` (which includes nvcomp.h and algorithm headers) → generates `nvcomp_bindings.rs` in the output directory. Configured with:
-   - `no_copy`, `no_debug` on all types
-   - Include paths: `/opt/cuda/include`, `/usr/local/cuda/include`
+1. **Bindgen** — parses `wrapper.h` → generates `nvcomp_bindings.rs`. Include paths: `/opt/cuda/include`, `/usr/local/cuda/include`. Generated `cudaDeviceProp` is 1008 bytes (CUDA 13.x correct).
 
-2. **CUDA compilation** — compiles two kernels via nvcc:
-   - `blake3.cu → blake3.ptx` — flags: `-ptx -O3 --use_fast_math --gpu-architecture=sm_86`
-   - `zstd_compress.cu → zstd_compress.ptx` — same flags + `--maxrregcount=64`
-   - PTX output placed alongside source files for `include_str!` embedding
+2. **CUDA compilation:**
+   - `zstd_compress.cu → zstd_compress.ptx` — flags: `-ptx -O3 --use_fast_math --gpu-architecture=sm_86 --maxrregcount=64`
+   - `lzma2_match_find.cu → lzma2_match_find.ptx` — flags: `-ptx -O3 --use_fast_math --gpu-architecture=sm_86`
+   - `blake3.cu → blake3.ptx` — compiled but dead code
+   - PTX placed alongside source files for `include_str!` embedding
 
-3. **Linking** — tells Cargo to link `nvcomp` and `cudart` from standard CUDA library paths
+3. **Linking** — `libnvcomp`, `libcudart`, `libzstd`. liblzma is loaded at runtime via dlopen (not linked here).
 
-**Release profile:** `codegen-units = 1` prevents LLVM from splitting codegen, which can cause CUDA FFI optimization bugs where function calls across codegen units get incorrectly optimized.
+**Release profile:** `codegen-units = 1` prevents LLVM from splitting codegen, which can cause CUDA FFI optimization bugs.
 
 ## concurrency model
 
-The project uses three concurrency mechanisms:
-
 | Mechanism | Where | Purpose |
 |-----------|-------|---------|
-| **std::thread** | pipeline.rs, pipeline_dual.rs | Pipeline stages (read/compress/write) |
-| **tokio tasks** | multi.rs, main.rs | Async file I/O, multi-file orchestration |
-| **crossbeam channels** | pipeline.rs, pipeline_dual.rs | Bounded backpressure between pipeline stages |
+| `std::thread` | pipeline*.rs | Pipeline stages |
+| `tokio` tasks | multi.rs, main.rs | Async file I/O, multi-file |
+| `crossbeam-channel` bounded | pipeline*.rs | Backpressure between stages |
+| `Arc<Receiver>` (shared MPMC) | pipeline_lzma2.rs L1+ | CPU encoder pool sub-block drain |
+| `Arc<AtomicU64>` | tui.rs, pipeline*.rs | Lock-free stats for TUI |
+| `BTreeMap<usize, CompressedChunk>` | writers | Chunk reordering |
+| `HashMap<usize, Vec<(usize, Vec<u8>)>>` | collector | Sub-block reassembly |
 
-**Pipeline threading:**
-- Single GPU: 3 worker threads + 1 stats thread
-- Dual GPU: reader + GPU0 + GPU1 + writer + stats = 5 threads
-- Multi-file: tokio runtime with blocking GPU task + async reader/writer tasks per file
-
-**Synchronization:**
-- `AtomicUsize` counters for lock-free stats collection
-- Bounded channels (depth 16) for backpressure
-- `BTreeMap` in dual-GPU writer for chunk reordering
-- GPU operations are inherently serialized per CUDA stream (default stream used)
-
-## data flow diagrams
-
-### single-file Zstd compression (level 0)
-
-```
-Input File
-    │
-    ▼
-┌─────────────────────┐
-│ Hash (GPU BLAKE3)   │ ← Computes hash before compression
-└─────────┬───────────┘
-          │ hash string
-          ▼
-┌─────────────────────┐
-│ Build tar archive   │ ← file + file.blake3 → tar stream
-│ Stream 4 MB chunks  │
-└─────────┬───────────┘
-          │ PipelineMsg::Chunk
-          ▼
-┌─────────────────────┐
-│ nvCOMP Zstd batch   │ ← compress_chunk_zstd() per chunk
-│ compress on GPU     │
-└─────────┬───────────┘
-          │ CompressedChunk
-          ▼
-┌─────────────────────┐
-│ Write NVZS file     │ ← header + size table + data
-│ Write .blake3 hash  │ ← hash of compressed output
-└─────────────────────┘
-```
-
-### single-file Zstd compression (levels 1-2)
-
-```
-Input File
-    │
-    ▼
-┌─────────────────────┐
-│ Read entire file     │
-│ Build tar in memory  │ ← file + blake3 hash → tar bytes
-└─────────┬───────────┘
-          │ tar bytes
-          ▼
-┌─────────────────────┐
-│ Split into 4 MB     │
-│ streaming chunks     │
-└─────────┬───────────┘
-          │ per chunk:
-          ▼
-┌─────────────────────────────────────┐
-│ compress_chunk_zstd_custom()        │
-│                                     │
-│  Split chunk → 64 KB sub-chunks     │
-│       │                             │
-│       ▼                             │
-│  zstd_match_find kernel             │
-│  (LZ77 + lazy/optimal matching)     │
-│       │                             │
-│       ▼                             │
-│  zstd_encode_block kernel           │
-│  (FSE encoding → Zstd frames)      │
-│       │                             │
-│       ▼                             │
-│  Concatenated Zstd frames           │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────┐
-│ Write NVZS file     │ ← same format as level 0
-└─────────────────────┘
-```
-
-### decompression (Zstd)
-
-```
-NVZS File
-    │
-    ▼
-┌─────────────────────┐
-│ Read magic + header  │ ← detect format
-│ Parse chunk sizes    │
-└─────────┬───────────┘
-          │ per chunk:
-          ▼
-┌─────────────────────┐
-│ nvCOMP Zstd batch   │ ← micro-batch (1 chunk)
-│ decompress on GPU   │
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ Reconstruct tar     │ ← write to temp .tar file
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ Extract tar         │ ← recover file + .blake3
-│ or detect raw file  │ ← (auto-detect tar vs raw content)
-└─────────┬───────────┘
-          │
-          ▼
-┌─────────────────────┐
-│ GPU BLAKE3 hash     │ ← hash decompressed file
-│ Compare to stored   │
-│ Retry legacy mode   │ ← if mismatch, try old flag behavior
-└─────────────────────┘
-```
+Thread counts:
+- Zstd single GPU: reader + compressor + writer + TUI stats = 4
+- Zstd dual GPU: reader + GPU0 + GPU1 + writer + TUI stats = 5
+- LZMA2 L0: reader + N CPU workers (up to 8) + writer + TUI stats = N+3
+- LZMA2 L1+: reader + G GPU threads + N CPU encoders + collector + supervisor + writer + TUI stats = G+N+4
 
 ## error handling
 
-- `anyhow::Result` throughout — all errors propagate with context
-- CUDA errors checked after every FFI call (device set, malloc, memcpy, kernel launch, sync)
-- nvCOMP status codes mapped to descriptive error messages
-- GPU detection failure is non-fatal for `detect_gpus()` (returns empty vec)
-- Decompression hash mismatch triggers legacy retry before final failure
-- Tar extraction handles both tar-wrapped and raw content (auto-detection)
+- `anyhow::Result` throughout; errors propagate with context strings
+- CUDA errors checked after every FFI call
+- nvCOMP status codes mapped to error messages
+- Zstd L1/L2: `ZSTD_compressSequences` failure falls back to `ZSTD_compress(level=1)` per sub-chunk
+- LZMA2 custom range coder: match encoding edge cases fall back to raw blocks
+- LZMA2 decompression: liblzma error codes surfaced as `anyhow::Error`
+- Thread join errors propagated as `anyhow::anyhow!("... panicked")`
+
+## known issues and workarounds
+
+| Issue | Workaround |
+|-------|-----------|
+| `cuda-runtime-sys 0.3.0-alpha.1` wrong `cudaDeviceProp` size (712 vs 1008 bytes) | Use `cudaDeviceProp` from `nvcomp_bindings` in `cuda.rs` |
+| `zstd_encode_block` GPU FSE kernel has FSE_Compressed mode bug | Not loaded; CPU `ZSTD_compressSequences` used instead |
+| LZMA2 custom range coder match encoding edge cases | Verification fallback to raw blocks |
+| LZMA2 L1 ratio slightly worse than L0 | 64KB sub-block independence prevents cross-block dictionary matching |
 
 ## changelog
 
-### v0.1.0 — initial release (ca566e7)
+### v0.1.0 — initial release
 
-14-module Rust codebase refactored from monolithic main.rs:
-- Zstd: 4 MB streaming chunks, auto dual-GPU, tar+blake3 integrity
-- Gdeflate: 64 KB batched chunks, 128 MB GPU batches, >2 GB multi-chunk (NVMC)
-- BLAKE3: custom CUDA kernel, 1 KB/thread, tree reduction
-- CLI: compress, compress-multi, decompress, decompress-multi, hash
-- Streaming pipeline with crossbeam channels and backpressure
-- Multi-file async pipeline via tokio
-- Directory compression with structure preservation
+- Zstd: nvCOMP batched API, 4 MB streaming chunks, auto dual-GPU, streaming pipeline
+- Gdeflate: nvCOMP batched API, 64 KB chunks, 128 MB batches
+- BLAKE3: custom CUDA kernel, integrity embedded in tar
+- CLI: compress, compress-multi, decompress, decompress-multi, hash subcommands
 
-### v0.1.0+fixes — bug fixes + custom Zstd kernel (c372516)
+### current state (2026-04-07)
 
-**Phase A — critical bug fixes:**
-- Fix Bitcomp/Zstd mismatch in compress-multi (was using wrong nvCOMP API)
-- Fix NVZS header format in multi-file writer (68B → 28B standard header)
-- Add tar auto-detection in decompressor for raw vs tar-wrapped content
-- Fix BLAKE3 CHUNK_START flag (was set on all blocks, now only block 0 per spec)
-- Add legacy BLAKE3 mode for backward compatibility with old .nvzs files
-- Properly scope unsafe blocks in cuda.rs with error checking
-
-**Phase B — custom GPU Zstd compression (`--level` flag):**
-- New `zstd_compress.cu`: LZ77 match finder with lazy matching, 14-bit hash table in shared memory, repeat offset tracking
-- New `compress_zstd_custom.rs`: Rust orchestrator for custom kernel pipeline
-- RLE-mode FSE encoding for uniform-symbol chunks (validated by CPU zstd)
-- Raw block fallback for mixed-symbol/incompressible chunks
-- Full round-trip verified: compress → nvCOMP decompress → BLAKE3 integrity
-- 5.3x compression on repetitive data, safe 1x fallback on random data
-
-**Build fixes:**
-- Add `codegen-units = 1` to release profile (fixes CUDA FFI optimization bug)
-- Compile `zstd_compress.cu` to PTX alongside `blake3.cu`
+- Added LZMA2: L0 (liblzma multi-threaded), L1+ (async GPU→buffer→CPU pipeline)
+- LZMA2 L1+: both GPUs run match finding, feed shared CPU encoder pool via MPMC
+- Added `--dict-size` flag: LZMA2 pipeline chunk size (dictionary window), stored in host RAM
+- Added NVLZ container format
+- Removed Gdeflate (NVGD, NVMC formats gone)
+- Removed tar wrapping and BLAKE3 integrity
+- Removed hash, compress-multi, decompress-multi CLI subcommands
+- Simplified to two subcommands: compress, decompress
+- Chunk size 4 MB → 8 MB
+- Custom Zstd L1/L2: switched from GPU FSE encoder to CPU ZSTD_compressSequences
+- Added TUI ANSI progress display
+- `pipeline_lzma2_dual.rs` superseded by multi-GPU-aware `pipeline_lzma2.rs`

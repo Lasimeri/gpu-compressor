@@ -14,6 +14,8 @@ fn main() {
     println!("cargo:rustc-link-search=native=/usr/lib");
     println!("cargo:rustc-link-lib=dylib=nvcomp");
     println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=zstd");
+    // liblzma loaded dynamically via dlopen in compress_lzma2.rs
 
     // Generate bindings for nvCOMP
     let bindings = bindgen::Builder::default()
@@ -73,6 +75,31 @@ fn main() {
         panic!(
             "CUDA compilation failed for zstd_compress.cu:\n{}",
             String::from_utf8_lossy(&output_zstd.stderr)
+        );
+    }
+
+    // Compile LZMA2 match finding kernel to PTX
+    println!("cargo:rerun-if-changed=lzma2_match_find.cu");
+
+    let output_lzma2 = Command::new("/opt/cuda/bin/nvcc")
+        .args([
+            "lzma2_match_find.cu",
+            "-ptx",
+            "-o",
+            "lzma2_match_find.ptx",
+            "--gpu-architecture=sm_86",
+            "-O3",
+            "--use_fast_math",
+            "--maxrregcount=64",
+            "-Xptxas=-v",
+        ])
+        .output()
+        .expect("Failed to compile lzma2_match_find.cu");
+
+    if !output_lzma2.status.success() {
+        panic!(
+            "CUDA compilation failed for lzma2_match_find.cu:\n{}",
+            String::from_utf8_lossy(&output_lzma2.stderr)
         );
     }
 }
